@@ -91,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ListeningSocketSource fires a callback for each new client connection.
     // new_auto() picks the next free wayland-N name under XDG_RUNTIME_DIR.
-    let socket = ListeningSocketSource::new_auto()?;
+    let socket = ListeningSocketSource::with_name("display-config-server-0")?;
     info!(
         "Listening on Wayland socket: {}",
         socket.socket_name().to_string_lossy()
