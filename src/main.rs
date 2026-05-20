@@ -1,8 +1,10 @@
-use std::os::unix::io::OwnedFd;
+mod drm_output;
+
 use std::sync::Arc;
 
+use drm_output::DcsOutput;
 use smithay::{
-    backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent},
+    backend::drm::DrmEvent,
     reexports::{
         calloop::EventLoop,
         wayland_server::{
@@ -10,10 +12,8 @@ use smithay::{
             Display,
         },
     },
-    utils::DeviceFd,
     wayland::socket::ListeningSocketSource,
 };
-
 use tracing::info;
 
 /// Per-client state.
@@ -21,69 +21,62 @@ use tracing::info;
 /// Clients connecting over the Wayland socket each get one of these. Empty
 /// for now; per-client protocol state will be stored here as protocols are
 /// added.
-struct ClientState;
+struct DcsClientState;
 
-impl ClientData for ClientState {
+impl ClientData for DcsClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
 /// Global compositor state.
 ///
-/// Holds resources that live for the lifetime of the server. As protocols and
-/// subsystems are added they will store their state here.
-struct State {
-    drm_device: DrmDevice,
+/// Holds resources that live for the lifetime of the server.
+struct DcsState {
+    output: DcsOutput,
 }
 
 /// Top-level data passed through the calloop event loop.
 ///
-/// calloop callbacks receive `&mut CalloopData`, so both the Wayland display
-/// and the compositor state must live here.
-struct CalloopData {
-    state: State,
-    display: Display<State>,
+/// calloop callbacks receive `&mut DcsCalloopData`, so both the Wayland
+/// display and the compositor state must live here.
+struct DcsCalloopData {
+    state: DcsState,
+    display: Display<DcsState>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up tracing output. The RUST_LOG environment variable controls the
-    // filter (e.g. RUST_LOG=debug).
+    // Set up tracing output. RUST_LOG controls the filter (e.g. RUST_LOG=debug).
     tracing_subscriber::fmt::init();
 
-    // Accept the DRM device path as an optional first argument so the server
-    // can be pointed at any card node. Default is the primary render node on
-    // most Linux systems.
+    // Accept the DRM device path as an optional first argument.
     let drm_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/dev/dri/card0".to_string());
 
-    info!("Opening DRM device: {}", drm_path);
+    info!("Initialising DRM device: {}", drm_path);
 
-    // Open the DRM device read/write so we can perform mode-setting.
-    let drm_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&drm_path)?;
-    let drm_fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(drm_file)));
-
-    // DrmDevice::new returns the device itself plus a DrmDeviceNotifier that
-    // must be registered with the event loop to receive VBlank / error events.
-    // disable_connectors=false leaves the current display state intact.
-    let (drm_device, drm_notifier) = DrmDevice::new(drm_fd, false)?;
-    info!("DRM device initialized");
+    // Build the output – this opens the device, picks a connected connector,
+    // creates the GBM/EGL/GLES stack, and returns a notifier for VBlanks.
+    let (mut output, drm_notifier) = DcsOutput::new(&drm_path)?;
+    // Do the first draw to initialize the screen(s) contents
+    output.render().expect("render failed");
+    info!("DRM output ready");
 
     // -------------------------------------------------------------------------
     // Event loop
     // -------------------------------------------------------------------------
 
-    let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
+    let mut event_loop: EventLoop<DcsCalloopData> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
-    // Drive the DRM device: VBlank events signal that a page flip completed and
-    // the next frame can be queued.
-    loop_handle.insert_source(drm_notifier, |event, _metadata, _data| match event {
-        DrmEvent::VBlank(crtc) => {
-            tracing::debug!("VBlank on crtc {:?}", crtc);
+    // VBlank events signal that a page flip completed; tell the compositor so
+    // it can retire the old buffer and allow a new frame to be queued.
+    loop_handle.insert_source(drm_notifier, |event, _metadata, data| match event {
+        DrmEvent::VBlank(_crtc) => {
+            data.state
+                .output
+                .frame_submitted()
+                .expect("frame_submitted failed");
         }
         DrmEvent::Error(err) => {
             tracing::error!("DRM error: {}", err);
@@ -94,21 +87,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wayland display
     // -------------------------------------------------------------------------
 
-    let display: Display<State> = Display::new()?;
+    let display: Display<DcsState> = Display::new()?;
 
-    // ListeningSocketSource wraps a Wayland socket and fires a callback for
-    // each new client connection. new_auto() picks the next free wayland-N
-    // name under XDG_RUNTIME_DIR.
+    // ListeningSocketSource fires a callback for each new client connection.
+    // new_auto() picks the next free wayland-N name under XDG_RUNTIME_DIR.
     let socket = ListeningSocketSource::new_auto()?;
     info!(
         "Listening on Wayland socket: {}",
         socket.socket_name().to_string_lossy()
     );
 
-    loop_handle.insert_source(socket, |client_stream, _, data: &mut CalloopData| {
+    loop_handle.insert_source(socket, |client_stream, _, data: &mut DcsCalloopData| {
         data.display
             .handle()
-            .insert_client(client_stream, Arc::new(ClientState))
+            .insert_client(client_stream, Arc::new(DcsClientState))
             .expect("Failed to insert Wayland client");
     })?;
 
@@ -116,17 +108,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run
     // -------------------------------------------------------------------------
 
-    let mut calloop_data = CalloopData {
-        state: State { drm_device },
+    let mut calloop_data = DcsCalloopData {
+        state: DcsState { output },
         display,
     };
 
     info!("Display config server started");
 
-    // The closure passed to run() is called once after each batch of events has
-    // been dispatched. This is where we flush pending Wayland protocol messages
-    // back to connected clients.
+    // The post-dispatch callback runs after each batch of events.  Render
+    // here so any state change driven by events is reflected on screen, then
+    // flush pending Wayland protocol messages back to clients.
     event_loop.run(None, &mut calloop_data, |data| {
+        data.state.output.render().expect("render failed");
         data.display
             .dispatch_clients(&mut data.state)
             .expect("Error dispatching Wayland clients");
