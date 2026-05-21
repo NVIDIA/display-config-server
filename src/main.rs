@@ -44,14 +44,44 @@ struct DcsCalloopData {
     display: Display<DcsState>,
 }
 
+/// Resolve the DRM device path from command-line arguments.
+///
+/// Supported forms:
+///   --card <N>          →  /dev/dri/cardN
+///   /dev/dri/cardN      →  used as-is (positional argument)
+///
+/// Defaults to `/dev/dri/card0` when no argument is given.
+fn parse_drm_path() -> Result<String, Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--card" => {
+                let n = args
+                    .next()
+                    .ok_or("--card requires a card number argument")?;
+                // Validate that it's a non-negative integer.
+                n.parse::<u32>()
+                    .map_err(|_| format!("--card: '{}' is not a valid card number", n))?;
+                return Ok(format!("/dev/dri/card{}", n));
+            }
+            path if !path.starts_with('-') => {
+                return Ok(path.to_string());
+            }
+            unknown => {
+                return Err(format!("unknown argument: {}", unknown).into());
+            }
+        }
+    }
+    Ok("/dev/dri/card0".to_string())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up tracing output. RUST_LOG controls the filter (e.g. RUST_LOG=debug).
     tracing_subscriber::fmt::init();
 
-    // Accept the DRM device path as an optional first argument.
-    let drm_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/dev/dri/card0".to_string());
+    // Parse --card <N> to select /dev/dri/cardN, or accept a full device path
+    // as a positional argument.  Defaults to card0.
+    let drm_path = parse_drm_path()?;
 
     info!("Initialising DRM device: {}", drm_path);
 
