@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+wayland-scanner = "0.31"
+wayland-server = "0.31"
 smithay = { version = "0.7", default-features = false, features = [
     "backend_drm",
     "backend_gbm",      # GbmDevice, GbmAllocator, EGLNativeDisplay for GBM

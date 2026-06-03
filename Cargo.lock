@@ -201,6 +201,8 @@ dependencies = [
  "smithay",
  "tracing",
  "tracing-subscriber",
+ "wayland-scanner",
+ "wayland-server",
 ]
 
 [[package]]

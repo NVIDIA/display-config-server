@@ -1,8 +1,61 @@
+//! Display Config Server (DCS)
+//!
+//! A Wayland compositor that owns and leases out displays for use by Vulkan Direct-to-Display
+//! (D2D) applications. The user launches this server to initialize and configure a set of
+//! displays. VK_KHR_display apps can then inherit this configuration on startup instead of
+//! re-initializing. This is used for display walls which have strong synchronization requirements
+//! and may take substantial time to initialize.
+//!
+//! In environments that do not have an X server (vulkan direct to display, wayland) there is
+//! currently no way to persistently configure displays. This poses a problem for advanced display
+//! features, where configuring a display wall or setting a particular mode is an expensive
+//! operation and it may not be desirable to repeat it. Persistence is also an issue, as there is
+//! no common server that "owns" the display and can hold it in whatever the configured mode is.
+//! Additionally there is no mechanism for specifying a configuration for a display, or existing
+//! projects which would do such a thing.
+//!
+//! This project is the "display config server", which will acquire a display, configure it
+//! according to what the user requested, and lease it out to consumers as requested. This allows
+//! for persistent configurations, and provides infrastructure for advanced display features which
+//! can be consumed by the leasing client.
+//!
+//! # System overview
+//!
+//! DCS sits at the centre of a three-party system:
+//!
+//! - **Display Config Server** (this binary) — acquires one or more DRM
+//!   displays at startup, renders a splash screen while idle, and re-leases
+//!   each display to Vulkan D2D clients on demand via the
+//!   `wp_drm_lease_device_v1` protocol. A private Wayland protocol
+//!   (`zwp_display_config_server_v1`) allows the configuration tool to query
+//!   and modify display settings atomically.
+//!
+//! - **Dynamic Configuration Tool** — CLI tool that reads a
+//!   saved configuration from disk at startup and forwards it to the server
+//!   over the private protocol. Users also invoke it directly to change
+//!   settings at runtime.
+//!
+//! - **VK_KHR_display Vulkan app** — connects to the DCS Wayland socket,
+//!   discovers the pre-configured display via `wp_drm_lease_device_v1`, and
+//!   drives it directly without issuing a modeset (the display link is already
+//!   trained by DCS, preserving framelock across lease transitions).
+//!
+//! # IPC
+//!
+//! Wayland is used as the IPC mechanism: it naturally models double-buffered configuration
+//! commits, and the upstream DRM leasing protocol (`wp_drm_lease_device_v1`) is already
+//! community-supported. This server is built on [Smithay], a Rust Wayland compositor toolkit.
+//!
+//! [Smithay]: https://github.com/Smithay/smithay
+
 mod drm_output;
+mod protocols;
+mod zwp_display_config_server_v1;
 
 use std::sync::Arc;
 
 use drm_output::DcsOutput;
+use protocols::zwp_display_config_server_v1::zwp_dcs_manager::ZwpDcsManager;
 use smithay::{
     backend::drm::DrmEvent,
     reexports::{
@@ -118,6 +171,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------------
 
     let display: Display<DcsState> = Display::new()?;
+
+    // Advertise the DCS private protocol in the registry so clients can bind
+    // the manager object.
+    display
+        .handle()
+        .create_global::<DcsState, ZwpDcsManager, _>(1, ());
 
     // ListeningSocketSource fires a callback for each new client connection.
     // new_auto() picks the next free wayland-N name under XDG_RUNTIME_DIR.
