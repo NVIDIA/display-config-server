@@ -48,13 +48,13 @@
 //!
 //! [Smithay]: https://github.com/Smithay/smithay
 
-mod drm_output;
 mod protocols;
+mod render;
 mod zwp_display_config_server_v1;
 
 use std::sync::Arc;
 
-use drm_output::DcsOutput;
+use render::DcsDevice;
 use protocols::zwp_display_config_server_v1::zwp_dcs_manager::ZwpDcsManager;
 use smithay::{
     backend::drm::DrmEvent,
@@ -85,7 +85,7 @@ impl ClientData for DcsClientState {
 ///
 /// Holds resources that live for the lifetime of the server.
 struct DcsState {
-    output: DcsOutput,
+    devices: Vec<DcsDevice>,
 }
 
 /// Top-level data passed through the calloop event loop.
@@ -138,12 +138,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Initialising DRM device: {}", drm_path);
 
-    // Build the output – this opens the device, picks a connected connector,
-    // creates the GBM/EGL/GLES stack, and returns a notifier for VBlanks.
-    let (mut output, drm_notifier) = DcsOutput::new(&drm_path)?;
-    // Do the first draw to initialize the screen(s) contents
-    output.render().expect("render failed");
-    info!("DRM output ready");
+    // Open the device, create the shared renderer, and enumerate all
+    // connected outputs. The initial splash frame is rendered below before
+    // the event loop starts.
+    let (mut device, drm_notifier) = DcsDevice::new(&drm_path)?;
+    device.render().expect("initial render failed");
 
     // -------------------------------------------------------------------------
     // Event loop
@@ -152,13 +151,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<DcsCalloopData> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
-    // VBlank events signal that a page flip completed; tell the compositor so
-    // it can retire the old buffer and allow a new frame to be queued.
-    loop_handle.insert_source(drm_notifier, |event, _metadata, data| match event {
-        DrmEvent::VBlank(_crtc) => {
-            data.state
-                .output
-                .frame_submitted()
+    // VBlank events carry the CRTC handle so we can dispatch directly to the
+    // output that flipped, leaving other outputs untouched.
+    let device_idx = 0usize;
+    loop_handle.insert_source(drm_notifier, move |event, _metadata, data| match event {
+        DrmEvent::VBlank(crtc) => {
+            data.state.devices[device_idx]
+                .frame_submitted(crtc)
                 .expect("frame_submitted failed");
         }
         DrmEvent::Error(err) => {
@@ -198,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------------
 
     let mut calloop_data = DcsCalloopData {
-        state: DcsState { output },
+        state: DcsState { devices: vec![device] },
         display,
     };
 
@@ -208,7 +207,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // here so any state change driven by events is reflected on screen, then
     // flush pending Wayland protocol messages back to clients.
     event_loop.run(None, &mut calloop_data, |data| {
-        data.state.output.render().expect("render failed");
+        for device in &mut data.state.devices {
+            device.render().expect("render failed");
+        }
         data.display
             .dispatch_clients(&mut data.state)
             .expect("Error dispatching Wayland clients");
