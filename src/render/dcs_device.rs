@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+
+use anyhow::Context;
 
 use smithay::{
     backend::{
@@ -85,9 +88,11 @@ impl DcsDevice {
         // Enumerate connected connectors; create one DcsOutput per CRTC
         // ------------------------------------------------------------------ //
         let icon_rgba = decode_icon()?;
+        let dev_t = std::fs::metadata(drm_path)?.rdev() as u32;
         let resources = drm_device.resource_handles()?;
         let mut outputs: HashMap<crtc::Handle, DcsOutput> = HashMap::new();
         let mut used_crtcs: HashSet<crtc::Handle> = HashSet::new();
+        let mut display_number: i32 = 1;
 
         for &connector_handle in resources.connectors() {
             let connector_info = match drm_device.get_connector(connector_handle, false) {
@@ -109,10 +114,13 @@ impl DcsDevice {
                 connector_info,
                 &icon_rgba,
                 &used_crtcs,
+                display_number,
+                dev_t,
             ) {
                 Ok((crtc, output)) => {
                     used_crtcs.insert(crtc);
                     outputs.insert(crtc, output);
+                    display_number += 1;
                 }
                 Err(e) => tracing::warn!("Failed to create output: {:#}", e),
             }
@@ -135,6 +143,71 @@ impl DcsDevice {
             output.render_with(&mut self.renderer)?;
         }
         Ok(())
+    }
+
+    /// Resolve `(width, height, refresh_mhz)` to the matching `drm::control::Mode`
+    /// reported by the connector attached to `crtc`.
+    ///
+    /// Shared by [`validate_output_mode_change`] and [`commit_output_mode_change`].
+    fn resolve_mode_for_crtc(
+        &self,
+        crtc: crtc::Handle,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    ) -> anyhow::Result<drm::control::Mode> {
+        let connector_handle = self.outputs
+            .get(&crtc)
+            .context("no output for CRTC")?
+            .current_connectors()
+            .into_iter()
+            .next()
+            .context("output has no connectors")?;
+
+        let connector_info = self.drm_device
+            .get_connector(connector_handle, false)
+            .context("failed to query connector")?;
+
+        connector_info
+            .modes()
+            .iter()
+            .find(|m: &&drm::control::Mode| {
+                let (mw, mh) = m.size();
+                mw as u32 == width && mh as u32 == height && m.vrefresh() * 1000 == refresh_mhz
+            })
+            .copied()
+            .with_context(|| format!("mode {}x{}@{}mHz not found for connector", width, height, refresh_mhz))
+    }
+
+    /// Test whether the requested mode is accepted by the hardware without
+    /// applying it.  Returns an error if the mode is unknown or the atomic
+    /// test commit is rejected.
+    pub fn validate_output_mode_change(
+        &self,
+        crtc: crtc::Handle,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    ) -> anyhow::Result<()> {
+        let mode = self.resolve_mode_for_crtc(crtc, width, height, refresh_mhz)?;
+        self.outputs.get(&crtc).unwrap().test_mode_change(mode)
+    }
+
+    /// Apply the requested mode to the output driven by `crtc`.
+    ///
+    /// Stages the change through the `DrmCompositor` (resizing the swapchain)
+    /// and marks the output for re-render so the hardware modeset fires on the
+    /// next `render_frame` call. No test commit is performed here; call
+    /// [`validate_output_mode_change`] first if validation is required.
+    pub fn commit_output_mode_change(
+        &mut self,
+        crtc: crtc::Handle,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    ) -> anyhow::Result<()> {
+        let mode = self.resolve_mode_for_crtc(crtc, width, height, refresh_mhz)?;
+        self.outputs.get_mut(&crtc).unwrap().apply_mode_change(mode)
     }
 
     /// Notify the output driving `crtc` that its queued frame has been

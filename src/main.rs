@@ -48,9 +48,9 @@
 //!
 //! [Smithay]: https://github.com/Smithay/smithay
 
+mod protocol;
 mod protocols;
 mod render;
-mod zwp_display_config_server_v1;
 
 use std::sync::Arc;
 
@@ -88,6 +88,53 @@ struct DcsState {
     devices: Vec<DcsDevice>,
 }
 
+impl DcsState {
+    /// Find the [`DcsOutput`] whose compositor drives `crtc`, searching across
+    /// all devices.  Returns `None` when no output owns that CRTC.
+    fn output_for_crtc(&self, crtc: drm::control::crtc::Handle) -> Option<&render::dcs_output::DcsOutput> {
+        self.devices.iter().find_map(|d| d.outputs.get(&crtc))
+    }
+
+    /// Mutable variant of [`output_for_crtc`].
+    fn output_for_crtc_mut(&mut self, crtc: drm::control::crtc::Handle) -> Option<&mut render::dcs_output::DcsOutput> {
+        self.devices.iter_mut().find_map(|d| d.outputs.get_mut(&crtc))
+    }
+
+    /// Test whether the requested mode is accepted by the hardware without
+    /// applying it, delegating to the owning [`DcsDevice`].
+    fn validate_output_mode_change(
+        &self,
+        crtc: drm::control::crtc::Handle,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    ) -> anyhow::Result<()> {
+        for device in &self.devices {
+            if device.outputs.contains_key(&crtc) {
+                return device.validate_output_mode_change(crtc, width, height, refresh_mhz);
+            }
+        }
+        anyhow::bail!("no device found for CRTC {:?}", crtc)
+    }
+
+    /// Apply the requested mode to the output driving `crtc`, delegating to
+    /// the owning [`DcsDevice`].
+    fn commit_output_mode_change(
+        &mut self,
+        crtc: drm::control::crtc::Handle,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    ) -> anyhow::Result<()> {
+        for device in &mut self.devices {
+            if device.outputs.contains_key(&crtc) {
+                return device.commit_output_mode_change(crtc, width, height, refresh_mhz);
+            }
+        }
+        anyhow::bail!("no device found for CRTC {:?}", crtc)
+    }
+}
+
 /// Top-level data passed through the calloop event loop.
 ///
 /// calloop callbacks receive `&mut DcsCalloopData`, so both the Wayland
@@ -103,7 +150,8 @@ struct DcsCalloopData {
 ///   --card <N>          →  /dev/dri/cardN
 ///   /dev/dri/cardN      →  used as-is (positional argument)
 ///
-/// Defaults to `/dev/dri/card0` when no argument is given.
+/// When no argument is given, tries `/dev/dri/card0` first, then falls back
+/// to `/dev/dri/card1` if `card0` does not exist.
 fn parse_drm_path() -> Result<String, Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -125,7 +173,16 @@ fn parse_drm_path() -> Result<String, Box<dyn std::error::Error>> {
             }
         }
     }
-    Ok("/dev/dri/card0".to_string())
+
+    // No explicit device given: prefer card0, fall back to card1.
+    let default = "/dev/dri/card0";
+    let fallback = "/dev/dri/card1";
+    if std::path::Path::new(default).exists() {
+        Ok(default.to_string())
+    } else {
+        info!("{} not found, falling back to {}", default, fallback);
+        Ok(fallback.to_string())
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

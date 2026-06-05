@@ -10,7 +10,7 @@ use smithay::{
         drm::{
             compositor::{DrmCompositor, FrameFlags},
             exporter::gbm::GbmFramebufferExporter,
-            DrmDevice, DrmDeviceFd,
+            DrmDevice, DrmDeviceFd, PlaneState,
         },
         renderer::{
             element::{
@@ -43,8 +43,27 @@ pub struct DcsOutput {
     compositor: GbmDrmCompositor,
     /// Pre-rendered splash frame sized to this output's resolution.
     splash: MemoryRenderBuffer,
+    /// Decoded RGBA bytes of the splash icon, retained for splash rebuilds on mode changes.
+    icon_rgba: Vec<u8>,
     /// Set whenever the screen content needs to be (re)drawn.
     pub needs_render: bool,
+
+    // ------------------------------------------------------------------
+    // Protocol-facing display info, populated at construction time and
+    // sent to clients via zwp_dcs_output events.
+    // ------------------------------------------------------------------
+    /// 1-based display index, shown on the splash screen and sent as the
+    /// `number` event.
+    pub display_number: i32,
+    /// Active mode width in pixels.
+    pub mode_width: u32,
+    /// Active mode height in pixels.
+    pub mode_height: u32,
+    /// Active mode refresh rate in mHz (e.g. 60000 for 60 Hz).
+    pub mode_refresh_mhz: u32,
+    /// DRM device number (st_rdev / dev_t, truncated to 32 bits) sent as
+    /// the `device` event so clients can identify which GPU owns this output.
+    pub dev_t: u32,
 }
 
 /// Build a CPU-side splash screen `(w × h)` pixels in `Fourcc::Argb8888`
@@ -147,6 +166,8 @@ impl DcsOutput {
         connector_info: connector::Info,
         icon_rgba: &[u8],
         used_crtcs: &HashSet<crtc::Handle>,
+        display_number: i32,
+        dev_t: u32,
     ) -> anyhow::Result<(crtc::Handle, Self)> {
         let mode = *connector_info
             .modes()
@@ -195,7 +216,17 @@ impl DcsOutput {
 
         let splash = build_splash(mw as i32, mh as i32, icon_rgba);
 
-        Ok((crtc, DcsOutput { compositor, splash, needs_render: true }))
+        Ok((crtc, DcsOutput {
+            compositor,
+            splash,
+            icon_rgba: icon_rgba.to_vec(),
+            needs_render: true,
+            display_number,
+            mode_width: mw as u32,
+            mode_height: mh as u32,
+            mode_refresh_mhz: mode.vrefresh() * 1000,
+            dev_t,
+        }))
     }
 
     /// Render the splash screen if `needs_render` is set.
@@ -235,6 +266,70 @@ impl DcsOutput {
             self.needs_render = false;
         }
 
+        Ok(())
+    }
+
+    /// Return the connector handles currently attached to this output's compositor.
+    ///
+    /// Used by [`super::DcsDevice`] to look up the connector's mode list when
+    /// processing a mode-change request.
+    pub(super) fn current_connectors(&self) -> impl IntoIterator<Item = drm::control::connector::Handle> {
+        self.compositor.current_connectors()
+    }
+
+    /// Attempt to change the active mode.
+    ///
+    /// The new mode is first staged on the underlying `DrmSurface` and tested
+    /// via an atomic test-only commit (on legacy KMS this falls back to a
+    /// buffer test or is assumed to succeed). If the test fails the surface is
+    /// reverted to its current mode and an error is returned. On success the
+    /// mode is applied through the `DrmCompositor` (which also resizes the
+    /// swapchain), the stored mode fields are updated, the splash is rebuilt at
+    /// the new resolution, and `needs_render` is set.
+    /// Test whether `mode` is accepted by the hardware without applying it.
+    ///
+    /// Stages the mode on the underlying `DrmSurface`, runs an atomic
+    /// test-only commit (best-effort on legacy KMS), then always reverts the
+    /// surface back to its current mode regardless of the outcome. Returns
+    /// `Ok(())` if the hardware would accept the mode, or an error if not.
+    pub fn test_mode_change(&self, mode: drm::control::Mode) -> anyhow::Result<()> {
+        let current_mode = self.compositor.current_mode();
+
+        // Stage the mode on the surface so test_state can evaluate it.
+        self.compositor
+            .surface()
+            .use_mode(mode)
+            .map_err(|e| anyhow::anyhow!("surface use_mode failed: {:?}", e))?;
+
+        // Atomic test-only commit (TEST_ONLY flag; no visible changes).
+        let result = self
+            .compositor
+            .surface()
+            .test_state(std::iter::empty::<PlaneState<'_>>(), true);
+
+        // Always revert — this is a test-only operation.
+        let _ = self.compositor.surface().use_mode(current_mode);
+
+        result.map_err(|e| anyhow::anyhow!("mode test commit rejected: {:?}", e))
+    }
+
+    /// Apply `mode` to this output.
+    ///
+    /// Stages the mode through the `DrmCompositor` (which also resizes the
+    /// swapchain), updates the stored mode fields, rebuilds the splash at the
+    /// new resolution, and sets `needs_render` so the hardware modeset is
+    /// issued on the next `render_frame` call.
+    pub fn apply_mode_change(&mut self, mode: drm::control::Mode) -> anyhow::Result<()> {
+        self.compositor
+            .use_mode(mode)
+            .map_err(|e| anyhow::anyhow!("compositor use_mode failed: {:?}", e))?;
+
+        let (mw, mh) = mode.size();
+        self.mode_width = mw as u32;
+        self.mode_height = mh as u32;
+        self.mode_refresh_mhz = mode.vrefresh() * 1000;
+        self.splash = build_splash(mw as i32, mh as i32, &self.icon_rgba);
+        self.needs_render = true;
         Ok(())
     }
 
