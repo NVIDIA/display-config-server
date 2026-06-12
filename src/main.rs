@@ -57,15 +57,25 @@ use std::sync::Arc;
 use render::DcsDevice;
 use protocols::zwp_display_config_server_v1::zwp_dcs_manager::ZwpDcsManager;
 use smithay::{
-    backend::drm::DrmEvent,
+    backend::drm::{DrmEvent, DrmNode},
+    delegate_drm_lease,
     reexports::{
-        calloop::EventLoop,
+        calloop::{
+            generic::Generic,
+            EventLoop, Interest, Mode, PostAction,
+        },
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             Display,
         },
     },
-    wayland::socket::ListeningSocketSource,
+    wayland::{
+        drm_lease::{
+            DrmLease, DrmLeaseBuilder, DrmLeaseHandler, DrmLeaseRequest, DrmLeaseState,
+            LeaseRejected,
+        },
+        socket::ListeningSocketSource,
+    },
 };
 use tracing::info;
 
@@ -134,6 +144,80 @@ impl DcsState {
         anyhow::bail!("no device found for CRTC {:?}", crtc)
     }
 }
+
+impl DrmLeaseHandler for DcsState {
+    fn drm_lease_state(&mut self, node: DrmNode) -> &mut DrmLeaseState {
+        self.devices
+            .iter_mut()
+            .find(|d| d.drm_node == node)
+            .and_then(|d| d.drm_lease_state.as_mut())
+            .expect("no DrmLeaseState for node")
+    }
+
+    fn lease_request(
+        &mut self,
+        _node: DrmNode,
+        request: DrmLeaseRequest,
+    ) -> Result<DrmLeaseBuilder, LeaseRejected> {
+        // Find the device that owns the requested connectors.
+        let device = self
+            .devices
+            .iter()
+            .find(|d| {
+                request.connectors.iter().all(|c| {
+                    d.outputs.values().any(|o| o.connector_handle == *c)
+                })
+            })
+            .ok_or_else(LeaseRejected::default)?;
+
+        let mut builder = DrmLeaseBuilder::new(&device.drm_device);
+
+        for &conn in &request.connectors {
+            builder.add_connector(conn);
+
+            // Find the output driving this connector and add its CRTC and
+            // primary plane. DRM_IOCTL_MODE_CREATE_LEASE requires at least one
+            // of each when DRM_CLIENT_CAP_UNIVERSAL_PLANES is enabled.
+            if let Some((&crtc, output)) = device.outputs.iter().find(|(_, o)| o.connector_handle == conn) {
+                builder.add_crtc(crtc);
+                if let Some((plane, claim)) = output.primary_plane_with_claim() {
+                    builder.add_plane(plane, claim);
+                }
+            }
+        }
+
+        Ok(builder)
+    }
+
+    fn new_active_lease(&mut self, _node: DrmNode, lease: DrmLease) {
+        info!("DRM lease {} granted", lease.id());
+        // Move the lease into the matching output. DrmLease::Drop revokes the
+        // kernel lease, so we must move (not clone) it into persistent storage.
+        let mut lease = Some(lease);
+        'outer: for device in &mut self.devices {
+            for output in device.outputs.values_mut() {
+                if lease.as_ref().map_or(false, |l| l.connectors().any(|c| *c == output.connector_handle)) {
+                    output.active_lease = lease.take();
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    fn lease_destroyed(&mut self, _node: DrmNode, lease_id: u32) {
+        info!("DRM lease {} destroyed", lease_id);
+        for device in &mut self.devices {
+            for output in device.outputs.values_mut() {
+                if output.active_lease.as_ref().map_or(false, |l| l.id() == lease_id) {
+                    output.active_lease = None;
+                    output.request_redraw();
+                }
+            }
+        }
+    }
+}
+
+delegate_drm_lease!(DcsState);
 
 /// Top-level data passed through the calloop event loop.
 ///
@@ -226,13 +310,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wayland display
     // -------------------------------------------------------------------------
 
-    let display: Display<DcsState> = Display::new()?;
+    let mut display: Display<DcsState> = Display::new()?;
+
+    // Wake the event loop whenever a connected client sends Wayland messages.
+    // Without this source the loop only wakes on DRM VBlanks and new socket
+    // connections, which means client messages are processed at VBlank rate
+    // (or not at all once rendering is idle).
+    // Duplicate the Wayland display poll fd into an OwnedFd so the mutable
+    // borrow on `display.backend()` ends before we use `display` again.
+    let wayland_poll_fd = display.backend().poll_fd().try_clone_to_owned()?;
+    loop_handle.insert_source(
+        Generic::new(wayland_poll_fd, Interest::READ, Mode::Level),
+        |_, _, data: &mut DcsCalloopData| {
+            data.display
+                .dispatch_clients(&mut data.state)?;
+            Ok(PostAction::Continue)
+        },
+    )?;
 
     // Advertise the DCS private protocol in the registry so clients can bind
     // the manager object.
     display
         .handle()
         .create_global::<DcsState, ZwpDcsManager, _>(1, ());
+
+    // Advertise wp_drm_lease_device_v1 so Vulkan D2D clients can lease the
+    // displays that DCS has configured.
+    {
+        let mut drm_lease_state = DrmLeaseState::new::<DcsState>(
+            &display.handle(),
+            &device.drm_node,
+        )?;
+
+        // Make every connected output available for leasing.
+        for output in device.outputs.values() {
+            let name = format!("DCS-{}", output.display_number);
+            let desc = format!(
+                "DCS display {} ({}x{})",
+                output.display_number, output.mode_width, output.mode_height
+            );
+            drm_lease_state.add_connector::<DcsState>(output.connector_handle, name, desc);
+        }
+
+        device.drm_lease_state = Some(drm_lease_state);
+    }
 
     // ListeningSocketSource fires a callback for each new client connection.
     // new_auto() picks the next free wayland-N name under XDG_RUNTIME_DIR.

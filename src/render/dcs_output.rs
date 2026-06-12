@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
 use anyhow::Context;
+use drm::control::{connector, crtc, Device as ControlDevice};
+use drm_fourcc::{DrmFormat, DrmFourcc};
+use smithay::wayland::drm_lease::DrmLease;
 use smithay::{
     backend::{
         allocator::{
@@ -10,7 +13,7 @@ use smithay::{
         drm::{
             compositor::{DrmCompositor, FrameFlags},
             exporter::gbm::GbmFramebufferExporter,
-            DrmDevice, DrmDeviceFd, PlaneState,
+            DrmDevice, DrmDeviceFd, PlaneClaim, PlaneState,
         },
         renderer::{
             element::{
@@ -23,20 +26,14 @@ use smithay::{
     output::OutputModeSource,
     utils::{Scale, Size, Transform},
 };
-use drm::control::{connector, crtc, Device as ControlDevice};
-use drm_fourcc::{DrmFormat, DrmFourcc};
 
 /// Grid cell size in pixels. The icon is centred inside each cell.
 const CELL: i32 = 80;
 const ICON_SIZE: i32 = 32;
 
 /// Fully typed alias for the GBM-backed DRM compositor.
-pub(crate) type GbmDrmCompositor = DrmCompositor<
-    GbmAllocator<DrmDeviceFd>,
-    GbmFramebufferExporter<DrmDeviceFd>,
-    (),
-    DrmDeviceFd,
->;
+pub(crate) type GbmDrmCompositor =
+    DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
 
 /// Rendering state for a single CRTC/connector output.
 pub struct DcsOutput {
@@ -52,6 +49,10 @@ pub struct DcsOutput {
     // Protocol-facing display info, populated at construction time and
     // sent to clients via zwp_dcs_output events.
     // ------------------------------------------------------------------
+    /// DRM connector handle for this output (used by DRM leasing).
+    pub connector_handle: drm::control::connector::Handle,
+    /// Active DRM lease for this output, if any. Dropping revokes the lease.
+    pub active_lease: Option<DrmLease>,
     /// 1-based display index, shown on the splash screen and sent as the
     /// `number` event.
     pub display_number: i32,
@@ -110,7 +111,14 @@ fn build_splash(w: i32, h: i32, icon_rgba: &[u8]) -> MemoryRenderBuffer {
         }
     }
 
-    MemoryRenderBuffer::from_slice(&pixels, Fourcc::Argb8888, (w, h), 1, Transform::Normal, None)
+    MemoryRenderBuffer::from_slice(
+        &pixels,
+        Fourcc::Argb8888,
+        (w, h),
+        1,
+        Transform::Normal,
+        None,
+    )
 }
 
 /// Find a free CRTC for `connector_info` that is not already in `used_crtcs`.
@@ -216,17 +224,22 @@ impl DcsOutput {
 
         let splash = build_splash(mw as i32, mh as i32, icon_rgba);
 
-        Ok((crtc, DcsOutput {
-            compositor,
-            splash,
-            icon_rgba: icon_rgba.to_vec(),
-            needs_render: true,
-            display_number,
-            mode_width: mw as u32,
-            mode_height: mh as u32,
-            mode_refresh_mhz: mode.vrefresh() * 1000,
-            dev_t,
-        }))
+        Ok((
+            crtc,
+            DcsOutput {
+                compositor,
+                splash,
+                icon_rgba: icon_rgba.to_vec(),
+                needs_render: true,
+                connector_handle: connector_info.handle(),
+                active_lease: None,
+                display_number,
+                mode_width: mw as u32,
+                mode_height: mh as u32,
+                mode_refresh_mhz: mode.vrefresh() * 1000,
+                dev_t,
+            },
+        ))
     }
 
     /// Render the splash screen if `needs_render` is set.
@@ -269,11 +282,41 @@ impl DcsOutput {
         Ok(())
     }
 
+    /// Return the primary plane handle and its claim for this output.
+    ///
+    /// Both are required by [`DrmLeaseBuilder`] alongside the connector and
+    /// CRTC — atomic KMS rejects a lease that does not include the primary
+    /// plane (`DRM_CLIENT_CAP_UNIVERSAL_PLANES` is enabled by smithay).
+    ///
+    /// The `PlaneClaim` is Arc-backed; cloning it does not release the
+    /// compositor's own hold on the plane.
+    pub fn primary_plane_with_claim(&self) -> Option<(drm::control::plane::Handle, PlaneClaim)> {
+        let plane = self.compositor.plane();
+        let claim = self.compositor.surface().claim_plane(plane)?;
+        Some((plane, claim))
+    }
+
+    /// Re-sync compositor state and schedule a redraw on the next render pass.
+    ///
+    /// Call this after a DRM lease ends.  `reset_state()` re-reads the actual
+    /// kernel CRTC/plane state so smithay's internal bookkeeping matches what
+    /// the hardware is doing.  With `SET_PERSISTENT_DISPLAY` enabled the CRTC
+    /// stays active (same mode, same connectors) so the subsequent render is a
+    /// page flip — no full modeset, framelock state is preserved.
+    pub fn request_redraw(&mut self) {
+        if let Err(e) = self.compositor.reset_state() {
+            tracing::warn!("Failed to reset DRM state after lease end: {}", e);
+        }
+        self.needs_render = true;
+    }
+
     /// Return the connector handles currently attached to this output's compositor.
     ///
     /// Used by [`super::DcsDevice`] to look up the connector's mode list when
     /// processing a mode-change request.
-    pub(super) fn current_connectors(&self) -> impl IntoIterator<Item = drm::control::connector::Handle> {
+    pub(super) fn current_connectors(
+        &self,
+    ) -> impl IntoIterator<Item = drm::control::connector::Handle> {
         self.compositor.current_connectors()
     }
 

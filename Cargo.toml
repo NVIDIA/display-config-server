@@ -12,10 +12,14 @@ smithay = { version = "0.7", default-features = false, features = [
     "renderer_gl",      # EGLDisplay, EGLContext, GlesRenderer
     "wayland_frontend",
 ] }
-drm = "0.14"           # drm::control::{Device, connector, crtc, encoder, ...}
+drm = "0.14"
 drm-fourcc = "2"       # DrmFourcc, DrmFormat, DrmModifier
 gbm = { version = "0.18", features = ["drm-support"] }
 png = "0.17"
+libc = "0.2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+smithay = { path = "smithay-patch" }

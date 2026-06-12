@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::os::fd::AsRawFd;
 use std::os::unix::io::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 
@@ -6,11 +7,12 @@ use anyhow::Context;
 
 use smithay::{
     backend::{
-        drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier},
+        drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmNode},
         egl::{EGLContext, EGLDisplay},
         renderer::gles::GlesRenderer,
     },
     utils::DeviceFd,
+    wayland::drm_lease::DrmLeaseState,
 };
 use drm::control::{connector, crtc, Device as ControlDevice};
 use drm_fourcc::DrmFormat;
@@ -20,19 +22,73 @@ use super::dcs_output::DcsOutput;
 /// The 32×32 RGBA PNG splash icon, embedded at compile time.
 const ICON_PNG: &[u8] = include_bytes!("../../assets/plus_icon.png");
 
+// ---------------------------------------------------------------------------
+// DRM_IOCTL_NVIDIA_SET_PERSISTENT_DISPLAY — nvidia-drm ioctl 0x1f
+//
+// Tells nvidia-drm to skip tearing down the hardware (disable_all +
+// releaseOwnership) when a DRM lessee drops its lease.  The CRTC, plane, and
+// scanout buffer stay alive so the primary master (DCS) can resume page
+// flipping without a modeset.  Framelock / genlock state in NVKMS is also
+// preserved because releaseOwnership is never called for lessees.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct SetPersistentDisplayParams {
+    enable: u32,
+    __pad: u32,
+}
+
+/// Build the ioctl request number for DRM_IOCTL_NVIDIA_SET_PERSISTENT_DISPLAY.
+///
+/// DRM_IOW('d', DRM_COMMAND_BASE + 0x1f, struct params)
+/// = _IOW('d', 0x5f, 8 bytes)
+///
+/// _IOW encodes: direction=WRITE(1), size=8, type='d', nr=0x5f
+const fn nvidia_set_persistent_display_ioctl() -> libc::c_ulong {
+    const IOC_WRITE: libc::c_ulong = 1;
+    const IOC_NRSHIFT: libc::c_ulong = 0;
+    const IOC_TYPESHIFT: libc::c_ulong = 8;
+    const IOC_SIZESHIFT: libc::c_ulong = 16;
+    const IOC_DIRSHIFT: libc::c_ulong = 30;
+    const NR: libc::c_ulong = 0x40 + 0x1f; // DRM_COMMAND_BASE + DRM_NVIDIA_SET_PERSISTENT_DISPLAY
+    const TYPE: libc::c_ulong = b'd' as libc::c_ulong;
+    const SIZE: libc::c_ulong = std::mem::size_of::<SetPersistentDisplayParams>() as libc::c_ulong;
+
+    (IOC_WRITE << IOC_DIRSHIFT)
+        | (TYPE << IOC_TYPESHIFT)
+        | (NR << IOC_NRSHIFT)
+        | (SIZE << IOC_SIZESHIFT)
+}
+
+unsafe fn set_persistent_display(fd: std::os::unix::io::RawFd, enable: bool) -> std::io::Result<()> {
+    let params = SetPersistentDisplayParams {
+        enable: if enable { 1 } else { 0 },
+        __pad: 0,
+    };
+    let ret = unsafe { libc::ioctl(fd, nvidia_set_persistent_display_ioctl(), &params) };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// All rendering resources belonging to a single DRM device (GPU).
 ///
 /// One `DcsDevice` is created per GPU. It owns the `GlesRenderer` that is
 /// shared across every output on that GPU, and a map of [`DcsOutput`]
 /// instances keyed by `crtc::Handle` for O(1) VBlank dispatch.
 pub struct DcsDevice {
-    // Kept alive to hold the DRM file descriptor open for the lifetime of the device.
-    #[allow(dead_code)]
-    drm_device: DrmDevice,
+    /// DRM device — kept public so the DRM lease handler can build leases.
+    pub drm_device: DrmDevice,
+    /// DRM node for this device, used to create and look up the lease global.
+    pub drm_node: DrmNode,
     /// Shared renderer for all outputs on this GPU.
     renderer: GlesRenderer,
     /// Active outputs keyed by the CRTC they drive.
     pub outputs: HashMap<crtc::Handle, DcsOutput>,
+    /// wp_drm_lease_device_v1 protocol state for this device.
+    pub drm_lease_state: Option<DrmLeaseState>,
 }
 
 /// Decode the embedded PNG icon and return raw RGBA8 bytes, row-major.
@@ -66,6 +122,22 @@ impl DcsDevice {
         let gbm_fd = drm_fd.clone();
 
         let (mut drm_device, drm_notifier) = DrmDevice::new(drm_fd, false)?;
+
+        // ------------------------------------------------------------------ //
+        // Enable persistent-display mode so nvidia-drm preserves CRTC and
+        // framelock state when a DRM lessee drops its lease.
+        // ------------------------------------------------------------------ //
+        match unsafe { set_persistent_display(drm_device.device_fd().as_raw_fd(), true) } {
+            Ok(()) => tracing::info!(
+                "Persistent display mode enabled; CRTC and framelock state \
+                 will be preserved across lease revocation"
+            ),
+            Err(e) => tracing::warn!(
+                "SET_PERSISTENT_DISPLAY not supported by driver ({}); \
+                 lease revocation will require a full modeset which resets framelock",
+                e
+            ),
+        }
 
         // ------------------------------------------------------------------ //
         // GBM → EGL → GLES renderer (shared across all outputs on this GPU)
@@ -134,7 +206,10 @@ impl DcsDevice {
 
         tracing::info!("{} output(s) initialised on {}", outputs.len(), drm_path);
 
-        Ok((DcsDevice { drm_device, renderer, outputs }, drm_notifier))
+        let drm_node = DrmNode::from_file(drm_device.device_fd())
+            .context("failed to get DrmNode from device fd")?;
+
+        Ok((DcsDevice { drm_device, drm_node, renderer, outputs, drm_lease_state: None }, drm_notifier))
     }
 
     /// Render all outputs that have `needs_render` set, skipping idle ones.
@@ -217,5 +292,16 @@ impl DcsDevice {
             output.frame_submitted()?;
         }
         Ok(())
+    }
+}
+
+impl Drop for DcsDevice {
+    fn drop(&mut self) {
+        match unsafe {
+            set_persistent_display(self.drm_device.device_fd().as_raw_fd(), false)
+        } {
+            Ok(()) => tracing::info!("Persistent display mode disabled"),
+            Err(e) => tracing::warn!("Failed to disable persistent display mode: {}", e),
+        }
     }
 }
