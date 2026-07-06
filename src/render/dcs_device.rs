@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::AsRawFd;
-use std::os::unix::io::OwnedFd;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::OwnedFd;
 
 use anyhow::Context;
 
+use drm::control::{connector, crtc, Device as ControlDevice};
+use drm_fourcc::DrmFormat;
 use smithay::{
     backend::{
         drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmNode},
@@ -14,8 +16,6 @@ use smithay::{
     utils::DeviceFd,
     wayland::drm_lease::DrmLeaseState,
 };
-use drm::control::{connector, crtc, Device as ControlDevice};
-use drm_fourcc::DrmFormat;
 
 use super::dcs_output::DcsOutput;
 
@@ -60,7 +60,10 @@ const fn nvidia_set_persistent_display_ioctl() -> libc::c_ulong {
         | (SIZE << IOC_SIZESHIFT)
 }
 
-unsafe fn set_persistent_display(fd: std::os::unix::io::RawFd, enable: bool) -> std::io::Result<()> {
+unsafe fn set_persistent_display(
+    fd: std::os::unix::io::RawFd,
+    enable: bool,
+) -> std::io::Result<()> {
     let params = SetPersistentDisplayParams {
         enable: if enable { 1 } else { 0 },
         __pad: 0,
@@ -209,7 +212,16 @@ impl DcsDevice {
         let drm_node = DrmNode::from_file(drm_device.device_fd())
             .context("failed to get DrmNode from device fd")?;
 
-        Ok((DcsDevice { drm_device, drm_node, renderer, outputs, drm_lease_state: None }, drm_notifier))
+        Ok((
+            DcsDevice {
+                drm_device,
+                drm_node,
+                renderer,
+                outputs,
+                drm_lease_state: None,
+            },
+            drm_notifier,
+        ))
     }
 
     /// Render all outputs that have `needs_render` set, skipping idle ones.
@@ -231,7 +243,8 @@ impl DcsDevice {
         height: u32,
         refresh_mhz: u32,
     ) -> anyhow::Result<drm::control::Mode> {
-        let connector_handle = self.outputs
+        let connector_handle = self
+            .outputs
             .get(&crtc)
             .context("no output for CRTC")?
             .current_connectors()
@@ -239,7 +252,8 @@ impl DcsDevice {
             .next()
             .context("output has no connectors")?;
 
-        let connector_info = self.drm_device
+        let connector_info = self
+            .drm_device
             .get_connector(connector_handle, false)
             .context("failed to query connector")?;
 
@@ -251,7 +265,12 @@ impl DcsDevice {
                 mw as u32 == width && mh as u32 == height && m.vrefresh() * 1000 == refresh_mhz
             })
             .copied()
-            .with_context(|| format!("mode {}x{}@{}mHz not found for connector", width, height, refresh_mhz))
+            .with_context(|| {
+                format!(
+                    "mode {}x{}@{}mHz not found for connector",
+                    width, height, refresh_mhz
+                )
+            })
     }
 
     /// Test whether the requested mode is accepted by the hardware without
@@ -292,16 +311,5 @@ impl DcsDevice {
             output.frame_submitted()?;
         }
         Ok(())
-    }
-}
-
-impl Drop for DcsDevice {
-    fn drop(&mut self) {
-        match unsafe {
-            set_persistent_display(self.drm_device.device_fd().as_raw_fd(), false)
-        } {
-            Ok(()) => tracing::info!("Persistent display mode disabled"),
-            Err(e) => tracing::warn!("Failed to disable persistent display mode: {}", e),
-        }
     }
 }
