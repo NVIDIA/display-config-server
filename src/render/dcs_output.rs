@@ -184,12 +184,15 @@ impl DcsOutput {
         let (mw, mh) = mode.size();
 
         tracing::info!(
-            "Connector {:?} ({:?}): {}x{}@{}Hz",
+            "Connector {:?} ({:?}): {}x{}@{}Hz hsync=({},{},{}) vsync=({},{},{}) clock={}kHz",
             connector_info.handle(),
             connector_info.interface(),
             mw,
             mh,
             mode.vrefresh(),
+            mode.hsync().0, mode.hsync().1, mode.hsync().2,
+            mode.vsync().0, mode.vsync().1, mode.vsync().2,
+            mode.clock(),
         );
 
         let crtc = find_crtc(drm_device, &connector_info, used_crtcs)?;

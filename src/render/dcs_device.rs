@@ -98,7 +98,23 @@ impl DcsDevice {
         let mut used_crtcs: HashSet<crtc::Handle> = HashSet::new();
         let mut display_number: i32 = 1;
 
+        // DCS_CONNECTOR=<id> limits DCS to a single connector for debugging.
+        let filter_connector: Option<u32> = std::env::var("DCS_CONNECTOR")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        if let Some(id) = filter_connector {
+            tracing::info!("DCS_CONNECTOR={} — only initialising that connector", id);
+        }
+
         for &connector_handle in resources.connectors() {
+            let raw_id: u32 = connector_handle.into();
+            if let Some(id) = filter_connector {
+                tracing::info!("DCS_CONNECTOR filter: connector raw_id={} vs filter={}", raw_id, id);
+                if raw_id != id {
+                    continue;
+                }
+            }
+
             let connector_info = match drm_device.get_connector(connector_handle, false) {
                 Ok(info) => info,
                 Err(e) => {
