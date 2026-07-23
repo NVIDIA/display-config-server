@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "dcs-test"]
+
 [package]
 name = "display-config-server"
 version = "0.1.0"
