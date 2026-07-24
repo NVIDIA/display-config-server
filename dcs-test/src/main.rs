@@ -51,8 +51,8 @@ impl TestResults {
     }
 }
 
-fn run_protocol_tests(results: &mut TestResults, socket: Option<&str>) -> Option<dcs_protocol::DcsProtocolState> {
-    let state = match dcs_protocol::query_dcs(socket) {
+fn run_protocol_tests(results: &mut TestResults) -> Option<dcs_protocol::DcsProtocolState> {
+    let state = match dcs_protocol::query_dcs() {
         Ok(s) => s,
         Err(e) => {
             results.fail("Protocol: connect to DCS", &e.to_string());
@@ -104,27 +104,41 @@ fn run_vulkan_tests(results: &mut TestResults) -> Option<Vec<vulkan::VkPhysDevic
                           total_displays, phys_devices.len()));
 
     for dev in &phys_devices {
+        println!("       Vulkan: {}", dev.device_name);
         for (i, display) in dev.displays.iter().enumerate() {
-            let prefix = format!("Vulkan: {} display {}", dev.device_name, i);
-
             if display.modes.is_empty() {
-                results.fail(&format!("{}: modes", prefix), "no modes");
+                results.fail(
+                    &format!("Vulkan: {} display {} ({})", dev.device_name, i, display.name),
+                    "no modes",
+                );
                 continue;
             }
-            results.pass(&format!("{}: {} mode(s)", prefix, display.modes.len()));
+
+            results.pass(&format!("Vulkan: {} display {} ({}):",
+                                  dev.device_name, i, display.name));
+            println!("       Vulkan:   {} mode(s) reported:", display.modes.len());
 
             for mode in &display.modes {
-                if mode.width == 0 || mode.height == 0 {
+                if mode.width == 0 || mode.height == 0 || mode.refresh_rate == 0 {
                     results.fail(
-                        &format!("{}: mode {}x{}@{}", prefix, mode.width, mode.height, mode.refresh_rate),
-                        "zero dimensions",
+                        &format!("Vulkan:   {}x{}@{}mHz", mode.width, mode.height, mode.refresh_rate),
+                        if mode.refresh_rate == 0 { "zero refresh rate" } else { "zero dimensions" },
                     );
-                } else if mode.refresh_rate == 0 {
-                    results.fail(
-                        &format!("{}: mode {}x{}@{}", prefix, mode.width, mode.height, mode.refresh_rate),
-                        "zero refresh rate",
-                    );
+                } else {
+                    println!("       Vulkan:   {}x{}@{}mHz", mode.width, mode.height, mode.refresh_rate);
                 }
+            }
+
+            // DCS should advertise exactly one mode per display (the
+            // configured mode). Multiple modes or duplicates indicate a
+            // bug in the WSI mode filtering.
+            if display.modes.len() != 1 {
+                results.fail(
+                    &format!("Vulkan: {} display {} mode count", dev.device_name, i),
+                    &format!("expected 1 mode, got {}", display.modes.len()),
+                );
+            } else {
+                results.pass(&format!("Vulkan: {} display {} has exactly 1 mode", dev.device_name, i));
             }
         }
     }
@@ -169,24 +183,18 @@ fn run_crosscheck(
 
 fn main() -> ExitCode {
     let mut protocol_only = false;
-    let mut socket: Option<String> = None;
 
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
+    for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--protocol-only" => protocol_only = true,
-            "--socket" => {
-                socket = Some(args.next().unwrap_or_else(|| {
-                    eprintln!("--socket requires an argument");
-                    std::process::exit(2);
-                }));
-            }
             "--help" | "-h" => {
                 eprintln!("Usage: dcs-test [OPTIONS]");
                 eprintln!();
+                eprintln!("Connects to the DCS Wayland socket (display-config-server-0)");
+                eprintln!("or the socket specified by WAYLAND_DISPLAY.");
+                eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --protocol-only   Skip Vulkan tests, only check DCS protocol");
-                eprintln!("  --socket <name>   Wayland socket name (default: $WAYLAND_DISPLAY)");
                 eprintln!("  --help            Show this help");
                 return ExitCode::from(0);
             }
@@ -200,7 +208,7 @@ fn main() -> ExitCode {
     let mut results = TestResults::new();
 
     // --- Protocol tests ---
-    let protocol_state = run_protocol_tests(&mut results, socket.as_deref());
+    let protocol_state = run_protocol_tests(&mut results);
 
     // --- Vulkan tests ---
     if !protocol_only {

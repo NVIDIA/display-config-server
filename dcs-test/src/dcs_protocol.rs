@@ -1,10 +1,7 @@
 //! Client-side bindings for the DCS private Wayland protocol, and a helper
 //! that connects to DCS and collects the advertised output state.
 
-use std::sync::{Arc, Mutex};
-
 use wayland_client::{
-    globals::{registry_queue_init, GlobalListContents},
     protocol::wl_registry,
     Connection, Dispatch, QueueHandle,
 };
@@ -52,65 +49,52 @@ pub struct DcsProtocolState {
     pub outputs: Vec<DcsOutputInfo>,
 }
 
-/// Internal mutable state used during the Wayland roundtrip.
-#[allow(dead_code)]
-struct ClientState {
-    result: Arc<Mutex<DcsProtocolState>>,
-}
-
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ClientState {
+impl Dispatch<wl_registry::WlRegistry, ()> for DcsProtocolState {
     fn event(
-        _state: &mut Self,
-        _proxy: &wl_registry::WlRegistry,
-        _event: wl_registry::Event,
-        _data: &GlobalListContents,
+        state: &mut Self,
+        _registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        // Registry events are handled by GlobalListContents automatically.
-    }
-}
-
-/// Connect to the DCS Wayland socket and query the advertised globals.
-///
-/// Returns `DcsProtocolState` with information about what globals are
-/// available. When DCS adds `wl_output` globals, this function will also
-/// enumerate output modes via the `zwp_dcs_manager::get_output` path.
-pub fn query_dcs(socket_name: Option<&str>) -> Result<DcsProtocolState, Box<dyn std::error::Error>> {
-    let conn = if let Some(name) = socket_name {
-        // Set WAYLAND_DISPLAY so the connection uses the right socket.
-        std::env::set_var("WAYLAND_DISPLAY", name);
-        Connection::connect_to_env()?
-    } else {
-        Connection::connect_to_env()?
-    };
-
-    let result = Arc::new(Mutex::new(DcsProtocolState {
-        manager_found: false,
-        drm_lease_found: false,
-        outputs: Vec::new(),
-    }));
-
-    let mut state = ClientState {
-        result: result.clone(),
-    };
-
-    let (globals, mut event_queue) = registry_queue_init::<ClientState>(&conn)?;
-
-    // Do one roundtrip to collect globals.
-    event_queue.roundtrip(&mut state)?;
-
-    // Check which globals are advertised.
-    {
-        let mut r = result.lock().unwrap();
-        for global in globals.contents().clone_list() {
-            match global.interface.as_str() {
-                "zwp_dcs_manager" => r.manager_found = true,
-                "wp_drm_lease_device_v1" => r.drm_lease_found = true,
+        if let wl_registry::Event::Global { interface, .. } = event {
+            match interface.as_str() {
+                "zwp_dcs_manager" => state.manager_found = true,
+                "wp_drm_lease_device_v1" => state.drm_lease_found = true,
                 _ => {}
             }
         }
     }
+}
 
-    Ok(Arc::try_unwrap(result).unwrap().into_inner().unwrap())
+/// The default socket name used by DCS.
+const DCS_SOCKET_NAME: &str = "display-config-server-0";
+
+/// Connect to the DCS Wayland socket and query the advertised globals.
+///
+/// Connects to `display-config-server-0` by default. If `WAYLAND_DISPLAY`
+/// is already set in the environment, that takes precedence.
+pub fn query_dcs() -> Result<DcsProtocolState, Box<dyn std::error::Error>> {
+    // Default to the DCS socket name if WAYLAND_DISPLAY is not set.
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        std::env::set_var("WAYLAND_DISPLAY", DCS_SOCKET_NAME);
+    }
+
+    let conn = Connection::connect_to_env()?;
+    let display = conn.display();
+
+    let mut event_queue = conn.new_event_queue();
+    let qh = event_queue.handle();
+
+    let mut state = DcsProtocolState {
+        manager_found: false,
+        drm_lease_found: false,
+        outputs: Vec::new(),
+    };
+
+    display.get_registry(&qh, ());
+    event_queue.roundtrip(&mut state)?;
+
+    Ok(state)
 }
