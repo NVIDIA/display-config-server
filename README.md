@@ -1,7 +1,9 @@
 # Display Config Server
 
-A leasing server that configures displays and leases them to Vulkan Direct-to-Display
-(D2D) applications on demand.
+A leasing server that configures displays and leases them to Vulkan
+Direct-to-Display (D2D) applications on demand. This supports display walls and
+advanced workstation features on platforms which do not have X11-based features
+such as NVIDIA Mosaic.
 
 ## Background
 
@@ -16,7 +18,7 @@ Display wall applications are recommended to move to Vulkan Direct to Display
 allows the application to directly control all of the displays in the system
 and avoids the overhead of keeping the X server in the loop.
 
-This approach has many benefits, but this project aims solves a few of the
+This approach has many benefits, but this project aims to solve a few of the
 downsides:
 - Every application must initialize the display from scratch, which can be slow
   and disrupts advanced display features that depend on a stable,
@@ -34,7 +36,10 @@ seamlessly during Vulkan D2D startup.
 
 ## System overview
 
-DCS sits at the centre of a three-party system:
+Instead of using MOSAIC or other NVIDIA X11 driver specific features to
+configure display walls, DCS will own displays and make them available to
+clients. Under this new architecture there are three components involved in
+driving a display wall:
 
 ```
 ┌───────────────────────┐                       ┌──────────────────────┐
@@ -60,9 +65,8 @@ conceptually similar to gamescope. It exposes two protocols:
   is already trained; the application drives it without issuing a modeset of
   its own.
 
-- `zwp_display_config_server_v1` — a private companion protocol (see
-  [Protocol](#protocol) below) used by the configuration tool to query and
-  modify display settings atomically.
+- `zwp_display_config_server_v1` — a private protocol used by the configuration
+  tool to query and modify display settings atomically.
 
 **Configuration Tool** — A CLI that reads a saved configuration from disk and
 forwards it to the server over the private protocol. Users also invoke it
