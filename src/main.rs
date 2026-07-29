@@ -58,7 +58,7 @@ use render::DcsDevice;
 use protocols::zwp_display_config_server_v1::zwp_dcs_manager::ZwpDcsManager;
 use smithay::{
     backend::drm::{DrmEvent, DrmNode},
-    delegate_drm_lease,
+    delegate_dispatch2,
     reexports::{
         calloop::{
             generic::Generic,
@@ -217,7 +217,7 @@ impl DrmLeaseHandler for DcsState {
     }
 }
 
-delegate_drm_lease!(DcsState);
+delegate_dispatch2!(DcsState);
 
 /// Top-level data passed through the calloop event loop.
 ///

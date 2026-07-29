@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "dcs-test"]
+exclude = ["smithay-patch"]
 
 [package]
 name = "display-config-server"
@@ -9,7 +10,7 @@ edition = "2021"
 [dependencies]
 wayland-scanner = "0.31"
 wayland-server = "0.31"
-smithay = { version = "0.7", default-features = false, features = [
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "3021f619e2ae4dab8bfb1e21f3f210923b9b6582", default-features = false, features = [
     "backend_drm",
     "backend_gbm",      # GbmDevice, GbmAllocator, EGLNativeDisplay for GBM
     "renderer_gl",      # EGLDisplay, EGLContext, GlesRenderer
@@ -23,6 +24,3 @@ libc = "0.2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[patch.crates-io]
-smithay = { path = "smithay-patch" }

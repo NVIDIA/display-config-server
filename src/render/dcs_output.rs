@@ -204,7 +204,10 @@ impl DcsOutput {
             gbm_device.clone(),
             GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING,
         );
-        let exporter = GbmFramebufferExporter::new(gbm_device.clone(), None);
+        let exporter = GbmFramebufferExporter::new(
+            gbm_device.clone(),
+            smithay::backend::drm::exporter::gbm::NodeFilter::None,
+        );
 
         let output_mode = OutputModeSource::Static {
             size: Size::from((mw as i32, mh as i32)),
@@ -319,7 +322,7 @@ impl DcsOutput {
     /// processing a mode-change request.
     pub(super) fn current_connectors(
         &self,
-    ) -> impl IntoIterator<Item = drm::control::connector::Handle> {
+    ) -> impl IntoIterator<Item = drm::control::connector::Handle> + use<'_> {
         self.compositor.current_connectors()
     }
 
