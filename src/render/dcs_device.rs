@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::OwnedFd;

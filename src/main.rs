@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 //! Display Config Server (DCS)
 //!
 //! A Wayland compositor that owns and leases out displays for use by Vulkan Direct-to-Display

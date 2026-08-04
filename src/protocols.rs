@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 /// Generated server-side bindings for the DCS private Wayland protocol.
 pub mod zwp_display_config_server_v1 {
     use wayland_server;

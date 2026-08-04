@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 //! Server-side request handlers for the `zwp_display_config_server_v1` private
 //! Wayland protocol.
 //!

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 //! dcs-test — test tool for the Display Config Server.
 //!
 //! Connects to a running DCS instance and verifies display/mode enumeration.

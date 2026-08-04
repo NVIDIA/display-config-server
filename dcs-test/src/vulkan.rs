@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 //! VK_KHR_display enumeration.
 //!
 //! Loads the Vulkan library, creates an instance, and enumerates all displays
