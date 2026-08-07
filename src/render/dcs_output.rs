@@ -53,6 +53,10 @@ pub struct DcsOutput {
     // ------------------------------------------------------------------
     /// DRM connector handle for this output (used by DRM leasing).
     pub connector_handle: drm::control::connector::Handle,
+    /// Modes reported by the connector at initialisation time.
+    /// Cached here so mode resolution can be performed without access to
+    /// the `DrmDevice` (e.g. inside [`DisplayAttribute::validate`]).
+    pub connector_modes: Vec<drm::control::Mode>,
     /// Active DRM lease for this output, if any. Dropping revokes the lease.
     pub active_lease: Option<DrmLease>,
     /// 1-based display index, shown on the splash screen and sent as the
@@ -179,8 +183,8 @@ impl DcsOutput {
         display_number: i32,
         dev_t: u32,
     ) -> anyhow::Result<(crtc::Handle, Self)> {
-        let mode = *connector_info
-            .modes()
+        let connector_modes: Vec<drm::control::Mode> = connector_info.modes().to_vec();
+        let mode = *connector_modes
             .first()
             .context("connector has no modes")?;
         let (mw, mh) = mode.size();
@@ -240,6 +244,7 @@ impl DcsOutput {
                 icon_rgba: icon_rgba.to_vec(),
                 needs_render: true,
                 connector_handle: connector_info.handle(),
+                connector_modes,
                 active_lease: None,
                 display_number,
                 mode_width: mw as u32,
@@ -337,6 +342,58 @@ impl DcsOutput {
     /// mode is applied through the `DrmCompositor` (which also resizes the
     /// swapchain), the stored mode fields are updated, the splash is rebuilt at
     /// the new resolution, and `needs_render` is set.
+    /// Resolve `(width, height, refresh_mhz)` to a [`drm::control::Mode`]
+    /// from this output's cached connector mode list.
+    fn resolve_mode_by_params(
+        &self,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    ) -> anyhow::Result<drm::control::Mode> {
+        self.connector_modes
+            .iter()
+            .find(|m| {
+                let (mw, mh) = m.size();
+                mw as u32 == width && mh as u32 == height && m.vrefresh() * 1000 == refresh_mhz
+            })
+            .copied()
+            .with_context(|| {
+                format!(
+                    "mode {}x{}@{}mHz not found for connector",
+                    width, height, refresh_mhz
+                )
+            })
+    }
+
+    /// Test whether the mode identified by `(width, height, refresh_mhz)` is
+    /// accepted by the hardware, without applying it.
+    ///
+    /// Resolves the mode from the cached connector mode list, then delegates
+    /// to [`test_mode_change`].
+    pub fn test_mode_change_by_params(
+        &self,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    ) -> anyhow::Result<()> {
+        let mode = self.resolve_mode_by_params(width, height, refresh_mhz)?;
+        self.test_mode_change(mode)
+    }
+
+    /// Apply the mode identified by `(width, height, refresh_mhz)` to this output.
+    ///
+    /// Resolves the mode from the cached connector mode list, then delegates
+    /// to [`apply_mode_change`].
+    pub fn apply_mode_change_by_params(
+        &mut self,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    ) -> anyhow::Result<()> {
+        let mode = self.resolve_mode_by_params(width, height, refresh_mhz)?;
+        self.apply_mode_change(mode)
+    }
+
     /// Test whether `mode` is accepted by the hardware without applying it.
     ///
     /// Stages the mode on the underlying `DrmSurface`, runs an atomic

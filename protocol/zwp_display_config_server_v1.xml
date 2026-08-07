@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <protocol name="zwp_display_config_server_v1">
   <copyright>
-    Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+    Copyright (c) 2026 NVIDIA CORPORATION &amp; AFFILIATES
 
     Permission is hereby granted, free of charge, to any person obtaining a
     copy of this software and associated documentation files (the "Software"),

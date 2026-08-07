@@ -50,6 +50,7 @@
 //!
 //! [Smithay]: https://github.com/Smithay/smithay
 
+mod attribute;
 mod protocol;
 mod protocols;
 mod render;
@@ -98,6 +99,9 @@ impl ClientData for DcsClientState {
 /// Holds resources that live for the lifetime of the server.
 struct DcsState {
     devices: Vec<DcsDevice>,
+    /// Pending attribute changes accumulated by sub-protocol handlers before a
+    /// topology commit fires.  `None` when no sub-protocol has staged changes.
+    pending_commit: Option<attribute::PendingCommit>,
 }
 
 impl DcsState {
@@ -377,7 +381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------------
 
     let mut calloop_data = DcsCalloopData {
-        state: DcsState { devices: vec![device] },
+        state: DcsState { devices: vec![device], pending_commit: None },
         display,
     };
 

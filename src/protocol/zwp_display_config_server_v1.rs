@@ -273,59 +273,82 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
 impl DcsState {
     /// Apply every configuration in `topology` to the live display state.
     ///
-    /// Processes each [`WlDcsDisplayConfiguration`] in insertion order:
-    /// - **Mode changes** are test-committed atomically before being applied; a
-    ///   hardware rejection is treated as a hard error.
-    /// - **Number changes** are applied directly without hardware interaction.
+    /// Builds a [`PendingCommit`] from the protocol configurations, merges in
+    /// any topology attributes accumulated by sub-protocol handlers, then
+    /// validates and applies all attributes atomically:
     ///
-    /// Returns `Ok(())` when all configurations applied successfully, or
+    /// 1. Validate topology attributes (cross-output invariants).
+    /// 2. Validate standalone display attributes (mode tests, etc.).
+    /// 3. Apply topology attributes (each applies its own child display attrs).
+    /// 4. Apply standalone display attributes.
+    ///
+    /// Returns `Ok(())` when all attributes applied successfully, or
     /// `Err((index, error))` identifying the first failing configuration. The
     /// caller is responsible for sending the corresponding protocol error events.
     fn apply_topology(&mut self, topology: &WlDcsTopology) -> Result<(), (usize, anyhow::Error)> {
-        // Collect all pending changes up front, releasing config locks promptly.
-        // Return early with the offending index if any config has no CRTC.
-        let changes: Vec<(crtc::Handle, Option<(u32, u32, u32)>, Option<u32>)> = {
-            let mut v = Vec::with_capacity(topology.configurations.len());
-            for (idx, config_resource) in topology.configurations.iter().enumerate() {
-                let config = config_resource
-                    .data::<Mutex<WlDcsDisplayConfiguration>>()
-                    .expect("wrong user data type on zwp_dcs_display_configuration")
-                    .lock()
-                    .unwrap();
-
-                let Some(crtc) = config.crtc else {
-                    return Err((idx, anyhow!("configuration has no associated CRTC")));
-                };
-
-                v.push((crtc, config.pending_mode, config.pending_number));
-            }
-            v
+        use crate::attribute::{
+            PendingCommit,
+            display_number::DisplayNumberAttribute,
+            mode::ModeAttribute,
         };
 
-        // Phase 1: validate all mode changes via atomic test commits before
-        // applying anything, so a hardware rejection never partially applies.
-        for (idx, &(crtc, pending_mode, _)) in changes.iter().enumerate() {
-            // Test Mode
-            if let Some((w, h, r)) = pending_mode {
-                self.validate_output_mode_change(crtc, w, h, r)
-                    .map_err(|e| (idx, e))?;
+        // Build PendingCommit from protocol configurations, merging in any
+        // topology attrs accumulated by sub-protocol handlers.
+        let mut commit = self.pending_commit.take().unwrap_or_else(PendingCommit::new);
+
+        for (idx, config_resource) in topology.configurations.iter().enumerate() {
+            let config = config_resource
+                .data::<Mutex<WlDcsDisplayConfiguration>>()
+                .expect("wrong user data type on zwp_dcs_display_configuration")
+                .lock()
+                .unwrap();
+
+            let Some(crtc) = config.crtc else {
+                return Err((idx, anyhow!("configuration has no associated CRTC")));
+            };
+
+            if let Some((w, h, r)) = config.pending_mode {
+                commit.display_attrs.push((crtc, Box::new(ModeAttribute {
+                    width: w,
+                    height: h,
+                    refresh_mhz: r,
+                })));
+            }
+
+            if let Some(number) = config.pending_number {
+                commit.display_attrs.push((crtc, Box::new(DisplayNumberAttribute {
+                    number,
+                })));
             }
         }
 
-        // Phase 2: apply all changes now that every mode has been validated.
-        for (idx, &(crtc, pending_mode, pending_number)) in changes.iter().enumerate() {
-            // Apply Mode
-            if let Some((w, h, r)) = pending_mode {
-                self.commit_output_mode_change(crtc, w, h, r)
-                    .map_err(|e| (idx, e))?;
+        // Phase 1: Validate topology attrs (cross-output invariants).
+        for topo_attr in &commit.topology_attrs {
+            for device in &self.devices {
+                topo_attr.validate(device).map_err(|e| (0, e))?;
             }
+        }
 
-            // Update Number
-            if let Some(number) = pending_number {
-                if let Some(output) = self.output_for_crtc_mut(crtc) {
-                    output.display_number = number as i32;
-                    output.needs_render = true;
-                }
+        // Phase 2: Validate standalone display attrs.
+        for (idx, (crtc, attr)) in commit.display_attrs.iter().enumerate() {
+            if let Some(output) = self.output_for_crtc(*crtc) {
+                attr.validate(output).map_err(|e| (idx, e))?;
+            } else {
+                return Err((idx, anyhow!("no output found for CRTC {:?}", crtc)));
+            }
+        }
+
+        // Phase 3: Apply topology attrs (each applies its children internally).
+        for topo_attr in &commit.topology_attrs {
+            for device in &mut self.devices {
+                topo_attr.apply(device).map_err(|e| (0, e))?;
+            }
+        }
+
+        // Phase 4: Apply standalone display attrs.
+        for (idx, (crtc, attr)) in commit.display_attrs.iter().enumerate() {
+            if let Some(output) = self.output_for_crtc_mut(*crtc) {
+                attr.apply(output).map_err(|e| (idx, e))?;
             }
         }
 
