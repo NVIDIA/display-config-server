@@ -340,6 +340,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .handle()
         .create_global::<DcsState, ZwpDcsManager, _>(1, ());
 
+    // Advertise the QuadroSync sub-protocol only when hardware is detected.
+    if device.quadro_sync_state.is_some() {
+        use crate::protocols::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_manager::ZwpDcsQuadroSyncManager;
+        display
+            .handle()
+            .create_global::<DcsState, ZwpDcsQuadroSyncManager, _>(1, ());
+        tracing::info!("Advertising zwp_dcs_quadro_sync_manager global");
+    }
+
     // Advertise wp_drm_lease_device_v1 so Vulkan D2D clients can lease the
     // displays that DCS has configured.
     {

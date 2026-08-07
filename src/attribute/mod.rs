@@ -11,6 +11,7 @@
 
 pub mod display_number;
 pub mod mode;
+pub mod quadro_sync;
 
 use drm::control::crtc;
 

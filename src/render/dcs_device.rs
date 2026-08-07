@@ -18,6 +18,8 @@ use smithay::{
     wayland::drm_lease::DrmLeaseState,
 };
 
+use crate::attribute::quadro_sync::{detect_quadro_sync, QuadroSyncState};
+
 use super::dcs_output::DcsOutput;
 
 /// The 32×32 RGBA PNG splash icon, embedded at compile time.
@@ -39,6 +41,8 @@ pub struct DcsDevice {
     pub outputs: HashMap<crtc::Handle, DcsOutput>,
     /// wp_drm_lease_device_v1 protocol state for this device.
     pub drm_lease_state: Option<DrmLeaseState>,
+    /// Populated at startup if QuadroSync hardware is detected.
+    pub quadro_sync_state: Option<QuadroSyncState>,
 }
 
 /// Decode the embedded PNG icon and return raw RGBA8 bytes, row-major.
@@ -159,6 +163,19 @@ impl DcsDevice {
         let drm_node = DrmNode::from_file(drm_device.device_fd())
             .context("failed to get DrmNode from device fd")?;
 
+        // Detect QuadroSync hardware via nvidia-drm ioctl.
+        let quadro_sync_state = {
+            use std::os::unix::io::{AsFd, AsRawFd};
+            let raw_fd = drm_device.as_fd().as_raw_fd();
+            let qs = detect_quadro_sync(raw_fd);
+            if let Some(ref s) = qs {
+                tracing::info!("QuadroSync detected: {} board(s)", s.num_boards);
+            } else {
+                tracing::info!("No QuadroSync hardware detected");
+            }
+            qs
+        };
+
         Ok((
             DcsDevice {
                 drm_device,
@@ -166,6 +183,7 @@ impl DcsDevice {
                 renderer,
                 outputs,
                 drm_lease_state: None,
+                quadro_sync_state,
             },
             drm_notifier,
         ))

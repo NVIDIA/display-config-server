@@ -39,6 +39,7 @@ use crate::protocols::zwp_display_config_server_v1::{
     zwp_dcs_output::{self, Mode as OutputMode, ZwpDcsOutput},
     zwp_dcs_topology::{self, Error as TopologyError, ZwpDcsTopology},
 };
+use crate::protocols::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_topology::ZwpDcsQuadroSyncTopology;
 use crate::DcsState;
 
 // ---------------------------------------------------------------------------
@@ -87,6 +88,9 @@ pub struct WlDcsDisplayConfiguration {
 pub struct WlDcsTopology {
     /// Configurations added via `add_configuration`, in insertion order.
     pub configurations: Vec<ZwpDcsDisplayConfiguration>,
+    /// Optional QuadroSync topology extension, set when a client calls
+    /// `zwp_dcs_quadro_sync_manager.get_topology(this_topology)`.
+    pub quadro_sync_topology: Option<ZwpDcsQuadroSyncTopology>,
 }
 
 impl GlobalDispatch<ZwpDcsManager, ()> for DcsState {
@@ -143,6 +147,7 @@ impl Dispatch<ZwpDcsManager, ()> for DcsState {
                     id,
                     Mutex::new(WlDcsTopology {
                         configurations: Vec::new(),
+                        quadro_sync_topology: None,
                     }),
                 );
             }
@@ -291,6 +296,14 @@ impl DcsState {
             display_number::DisplayNumberAttribute,
             mode::ModeAttribute,
         };
+
+        // If a QuadroSync topology extension is associated with this topology,
+        // build its attribute and stage it into pending_commit before processing
+        // the base configurations.
+        if let Some(ref qs_topo) = topology.quadro_sync_topology {
+            self.build_quadro_sync_attribute(qs_topo)
+                .map_err(|e| (0, e))?;
+        }
 
         // Build PendingCommit from protocol configurations, merging in any
         // topology attrs accumulated by sub-protocol handlers.
