@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "dcs-test"]
+members = [".", "dcs-config", "dcs-test"]
 exclude = ["smithay-patch"]
 
 [package]
