@@ -54,6 +54,7 @@ mod attribute;
 mod protocol;
 mod protocols;
 mod render;
+mod wl_output;
 
 use std::sync::Arc;
 
@@ -368,6 +369,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         device.drm_lease_state = Some(drm_lease_state);
+    }
+
+    // Advertise one wl_output global per connected display so that
+    // dcs-config clients can call zwp_dcs_manager.get_output().
+    // The crtc::Handle is stored as global data and resolved by the
+    // get_output handler via output.data::<crtc::Handle>().
+    {
+        use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
+        for &crtc in device.outputs.keys() {
+            display.handle().create_global::<DcsState, WlOutput, _>(4, crtc);
+        }
     }
 
     // ListeningSocketSource fires a callback for each new client connection.
