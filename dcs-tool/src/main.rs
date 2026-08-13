@@ -85,23 +85,48 @@ fn main() -> ExitCode {
 
 fn cmd_show() -> anyhow::Result<()> {
     let mut client = connect()?;
+    let quadro_sync = client.quadro_sync_supported();
     let outputs = client.enumerate_outputs()?;
 
     if outputs.is_empty() {
         println!("No displays found.");
-        return Ok(());
+    } else {
+        for output in &outputs {
+            let dev = output.dev_t;
+            let num = output.display_number;
+
+            // Header line: display number and device
+            println!("Display {:2}  (dev {})", num, dev);
+
+            if output.modes.is_empty() {
+                println!("  (no modes)");
+            } else {
+                for mode in &output.modes {
+                    let marker = if mode.current {
+                        "* "
+                    } else {
+                        "  "
+                    };
+                    let tag = match (mode.current, mode.preferred) {
+                        (true, _)      => " [current]",
+                        (false, true)  => " [preferred]",
+                        _              => "",
+                    };
+                    println!(
+                        "{}{}x{}@{}mHz{}",
+                        marker, mode.width, mode.height, mode.refresh_mhz, tag
+                    );
+                }
+            }
+        }
     }
 
-    for output in &outputs {
-        println!(
-            "Display {:2}  (dev {:5})  {}x{}@{}mHz  [current]",
-            output.display_number,
-            output.dev_t,
-            output.mode_width,
-            output.mode_height,
-            output.mode_refresh_mhz,
-        );
-    }
+    println!();
+    println!(
+        "QuadroSync: {}",
+        if quadro_sync { "supported" } else { "not detected" }
+    );
+
     Ok(())
 }
 
