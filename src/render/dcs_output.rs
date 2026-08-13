@@ -437,6 +437,16 @@ impl DcsOutput {
         self.mode_height = mh as u32;
         self.mode_refresh_mhz = mode.vrefresh() * 1000;
         self.splash = build_splash(mw as i32, mh as i32, &self.icon_rgba);
+
+        // Reset the compositor's internal damage state so the next render_frame
+        // call sees a fully-damaged frame and issues the atomic commit that
+        // applies the new mode to hardware.  Without this, render_frame may
+        // return is_empty=true (no damage detected) and skip queue_frame,
+        // leaving the mode change staged but never committed.
+        if let Err(e) = self.compositor.reset_state() {
+            tracing::warn!("failed to reset compositor state after mode change: {}", e);
+        }
+
         self.needs_render = true;
         Ok(())
     }

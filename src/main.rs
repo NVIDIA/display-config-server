@@ -408,16 +408,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Display config server started");
 
-    // The post-dispatch callback runs after each batch of events.  Render
-    // here so any state change driven by events is reflected on screen, then
-    // flush pending Wayland protocol messages back to clients.
+    // The post-dispatch callback runs after each batch of events.  Dispatch
+    // client messages first so that any state changes (mode commits, etc.) are
+    // applied before rendering, ensuring the new configuration is reflected on
+    // screen in the same iteration rather than the next one.
     event_loop.run(None, &mut calloop_data, |data| {
-        for device in &mut data.state.devices {
-            device.render().expect("render failed");
-        }
         data.display
             .dispatch_clients(&mut data.state)
             .expect("Error dispatching Wayland clients");
+        for device in &mut data.state.devices {
+            device.render().expect("render failed");
+        }
         data.display
             .flush_clients()
             .expect("Error flushing Wayland clients");

@@ -204,14 +204,14 @@ impl Dispatch<ZwpDcsOutput, usize> for ClientState {
         let Some(pending) = state.pending.get_mut(*index) else { return };
         match event {
             zwp_dcs_output::Event::Mode { mode, width, height, refresh } => {
-                // mode flag: 0 = Current, 1 = Preferred, other = neither
+                // mode enum: 0 = none, 1 = current (active), 2 = preferred (native).
                 let raw: u32 = mode.into();
                 pending.modes.push(ModeInfo {
                     width,
                     height,
                     refresh_mhz: refresh,
-                    current:   raw == 0,
-                    preferred: raw == 1,
+                    current:   raw == 1,
+                    preferred: raw == 2,
                 });
             }
             zwp_dcs_output::Event::Device { device } => {

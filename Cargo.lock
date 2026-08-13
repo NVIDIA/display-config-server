@@ -299,9 +299,8 @@ name = "dcs-test"
 version = "0.1.0"
 dependencies = [
  "ash",
- "wayland-client",
+ "dcs-config",
  "wayland-protocols 0.31.2",
- "wayland-scanner",
 ]
 
 [[package]]

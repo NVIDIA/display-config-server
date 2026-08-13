@@ -199,6 +199,8 @@ fn parse_mode(s: &str) -> anyhow::Result<ModeConfig> {
             .parse()
             .with_context(|| format!("invalid height in '{s}'"))?,
         refresh_mhz: refresh_str
+            .strip_suffix("mHz")
+            .unwrap_or(refresh_str)
             .parse()
             .with_context(|| format!("invalid refresh rate in '{s}'"))?,
     })
@@ -233,5 +235,11 @@ mod tests {
     #[test]
     fn parse_mode_non_numeric_width() {
         assert!(parse_mode("axb@60000").is_err());
+    }
+
+    #[test]
+    fn parse_mode_mhz_suffix() {
+        let m = parse_mode("1920x1080@60000mHz").unwrap();
+        assert_eq!(m.refresh_mhz, 60000);
     }
 }

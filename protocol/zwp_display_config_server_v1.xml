@@ -93,11 +93,13 @@
     </description>
 
     <enum name="mode">
-      <description summary="mode flags"/>
-      <entry name="current" value="0"
+      <description summary="mode type"/>
+      <entry name="none" value="0"
+             summary="an available but non-active, non-preferred mode"/>
+      <entry name="current" value="1"
              summary="this is the currently set mode for this display"/>
-      <entry name="preferred" value="1"
-             summary="this is the native mode and refresh rate"/>
+      <entry name="preferred" value="2"
+             summary="this is the native (first-listed) mode and refresh rate"/>
     </enum>
 
     <event name="mode">
