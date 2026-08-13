@@ -130,12 +130,25 @@ impl Dispatch<ZwpDcsManager, ()> for DcsState {
                 // Send the initial burst of events describing this output.
                 if let Some(crtc) = crtc {
                     if let Some(dcs_out) = state.output_for_crtc(crtc) {
-                        resource.mode(
-                            OutputMode::Current,
-                            dcs_out.mode_width,
-                            dcs_out.mode_height,
-                            dcs_out.mode_refresh_mhz,
-                        );
+                        // Send one mode event per connector mode.
+                        // flags: Current = active mode, Preferred = first (native) mode.
+                        for (i, drm_mode) in dcs_out.connector_modes.iter().enumerate() {
+                            let (w, h) = drm_mode.size();
+                            let refresh_mhz = drm_mode.vrefresh() * 1000;
+                            let is_current = w as u32 == dcs_out.mode_width
+                                && h as u32 == dcs_out.mode_height
+                                && refresh_mhz == dcs_out.mode_refresh_mhz;
+                            let flags = if is_current {
+                                OutputMode::Current
+                            } else if i == 0 {
+                                OutputMode::Preferred
+                            } else {
+                                // For modes that are neither current nor preferred,
+                                // construct an unknown mode flag value (2).
+                                unsafe { std::mem::transmute::<u32, OutputMode>(2) }
+                            };
+                            resource.mode(flags, w as u32, h as u32, refresh_mhz);
+                        }
                         resource.device(dcs_out.dev_t);
                         resource.number(dcs_out.display_number);
                         resource.done();
