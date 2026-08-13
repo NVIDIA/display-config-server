@@ -103,9 +103,9 @@ fn cmd_show() -> anyhow::Result<()> {
             } else {
                 for mode in &output.modes {
                     let marker = if mode.current {
-                        "* "
+                        "  * "
                     } else {
-                        "  "
+                        "    "
                     };
                     let tag = match (mode.current, mode.preferred) {
                         (true, _)      => " [current]",
