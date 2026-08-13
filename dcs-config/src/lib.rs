@@ -13,4 +13,4 @@ pub(crate) mod protocol;
 
 pub use config::{Config, DisplayConfig, ModeConfig, TopologyConfig};
 pub use connection::DcsClient;
-pub use output::OutputInfo;
+pub use output::{ModeInfo, OutputInfo};

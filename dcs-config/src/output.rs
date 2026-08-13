@@ -6,24 +6,42 @@ use anyhow::Context;
 
 use crate::connection::{BoundOutput, DcsClient, PendingOutput};
 
+/// One display mode reported by the server.
+#[derive(Debug, Clone)]
+pub struct ModeInfo {
+    pub width: u32,
+    pub height: u32,
+    /// Refresh rate in millihertz (e.g. 60000 for 60 Hz).
+    pub refresh_mhz: u32,
+    /// True if this is the currently active mode.
+    pub current: bool,
+    /// True if this is the preferred (native) mode.
+    pub preferred: bool,
+}
+
 /// Current state of one DCS-managed display, as reported by the server.
 #[derive(Debug, Clone)]
 pub struct OutputInfo {
     /// 1-based display index (from the `number` event).
     pub display_number: i32,
-    pub mode_width: u32,
-    pub mode_height: u32,
-    /// Refresh rate in millihertz (e.g. 60000 for 60 Hz).
-    pub mode_refresh_mhz: u32,
     /// DRM device number (dev_t truncated to u32).
     pub dev_t: u32,
+    /// All modes reported by the server for this output.
+    pub modes: Vec<ModeInfo>,
+}
+
+impl OutputInfo {
+    /// Returns the currently active mode, if any.
+    pub fn current_mode(&self) -> Option<&ModeInfo> {
+        self.modes.iter().find(|m| m.current)
+    }
 }
 
 impl DcsClient {
     /// Enumerate all displays currently managed by DCS.
     ///
     /// For each `wl_output` global collected during [`connect`], calls
-    /// `zwp_dcs_manager.get_output`, does a roundtrip to collect
+    /// `zwp_dcs_manager.get_output`, does a roundtrip to collect all
     /// `mode`/`device`/`number`/`done` events, and returns one
     /// [`OutputInfo`] per display.
     ///
@@ -61,10 +79,8 @@ impl DcsClient {
             }
             let info = OutputInfo {
                 display_number: pending.display_number.unwrap_or(-1),
-                mode_width: pending.mode_width,
-                mode_height: pending.mode_height,
-                mode_refresh_mhz: pending.mode_refresh_mhz,
                 dev_t: pending.dev_t.unwrap_or(0),
+                modes: pending.modes.clone(),
             };
             bound.push(BoundOutput {
                 wl_output: wl_output.clone(),

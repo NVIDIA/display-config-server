@@ -8,7 +8,7 @@ use wayland_client::{
     protocol::{wl_output::WlOutput, wl_registry},
 };
 
-use crate::output::OutputInfo;
+use crate::output::{ModeInfo, OutputInfo};
 use crate::protocol::zwp_display_config_server_v1::{
     zwp_dcs_display_configuration::{self, ZwpDcsDisplayConfiguration},
     zwp_dcs_manager::{self, ZwpDcsManager},
@@ -27,10 +27,8 @@ const DCS_SOCKET: &str = "display-config-server-0";
 #[derive(Default, Clone)]
 pub(crate) struct PendingOutput {
     pub display_number: Option<i32>,
-    pub mode_width: u32,
-    pub mode_height: u32,
-    pub mode_refresh_mhz: u32,
     pub dev_t: Option<u32>,
+    pub modes: Vec<ModeInfo>,
     pub done: bool,
 }
 
@@ -50,6 +48,8 @@ pub(crate) struct ClientState {
     pub wl_outputs: Vec<WlOutput>,
     /// Set to true if `wp_drm_lease_device_v1` is advertised.
     pub drm_lease_found: bool,
+    /// Set to true if `zwp_dcs_quadro_sync_manager` is advertised.
+    pub quadro_sync_found: bool,
     /// Temporary output slots, indexed by position in `wl_outputs`,
     /// populated during `enumerate_outputs`.
     pub pending: Vec<PendingOutput>,
@@ -82,6 +82,11 @@ impl DcsClient {
     pub fn drm_lease_found(&self) -> bool {
         self.state.drm_lease_found
     }
+
+    /// Returns true if QuadroSync hardware was detected by DCS.
+    pub fn quadro_sync_supported(&self) -> bool {
+        self.state.quadro_sync_found
+    }
 }
 
 /// Connect to the DCS Wayland socket.
@@ -105,6 +110,7 @@ pub fn connect() -> anyhow::Result<DcsClient> {
         manager_raw: None,
         wl_outputs: Vec::new(),
         drm_lease_found: false,
+        quadro_sync_found: false,
         pending: Vec::new(),
         bound_outputs: Vec::new(),
         topology_error: false,
@@ -150,6 +156,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 "wp_drm_lease_device_v1" => {
                     state.drm_lease_found = true;
                 }
+                "zwp_dcs_quadro_sync_manager" => {
+                    state.quadro_sync_found = true;
+                }
                 _ => {}
             }
         }
@@ -194,10 +203,16 @@ impl Dispatch<ZwpDcsOutput, usize> for ClientState {
     ) {
         let Some(pending) = state.pending.get_mut(*index) else { return };
         match event {
-            zwp_dcs_output::Event::Mode { width, height, refresh, .. } => {
-                pending.mode_width = width;
-                pending.mode_height = height;
-                pending.mode_refresh_mhz = refresh;
+            zwp_dcs_output::Event::Mode { mode, width, height, refresh } => {
+                // mode flag: 0 = Current, 1 = Preferred, other = neither
+                let raw: u32 = mode.into();
+                pending.modes.push(ModeInfo {
+                    width,
+                    height,
+                    refresh_mhz: refresh,
+                    current:   raw == 0,
+                    preferred: raw == 1,
+                });
             }
             zwp_dcs_output::Event::Device { device } => {
                 pending.dev_t = Some(device);
