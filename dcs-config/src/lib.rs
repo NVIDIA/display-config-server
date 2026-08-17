@@ -11,6 +11,9 @@ pub mod output;
 pub mod apply;
 pub(crate) mod protocol;
 
-pub use config::{Config, DisplayConfig, ModeConfig, TopologyConfig};
+pub use config::{
+    Config, DisplayConfig, HouseSyncMode, ModeConfig, QuadroSyncConfig,
+    QuadroSyncPolarity, QuadroSyncRole, TopologyConfig,
+};
 pub use connection::DcsClient;
 pub use output::{ModeInfo, OutputInfo};

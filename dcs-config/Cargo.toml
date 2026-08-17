@@ -8,3 +8,6 @@ wayland-client = "0.31"
 wayland-scanner = "0.31"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_yaml = "0.9"
