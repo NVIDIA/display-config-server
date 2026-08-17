@@ -89,6 +89,19 @@ struct ApplyArgs {
     qs_disable: bool,
 }
 
+impl ApplyArgs {
+    /// True when any board-level QuadroSync flag was given
+    /// (`--qs-sync-delay`, `--qs-polarity`, `--qs-house-sync`,
+    /// `--qs-enable`, `--qs-disable`).
+    fn has_board_settings(&self) -> bool {
+        self.qs_sync_delay.is_some()
+            || self.qs_polarity.is_some()
+            || self.qs_house_sync.is_some()
+            || self.qs_enable
+            || self.qs_disable
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -172,7 +185,7 @@ fn cmd_show() -> anyhow::Result<()> {
 fn cmd_apply(args: ApplyArgs) -> anyhow::Result<()> {
     if let Some(path) = &args.config {
         cmd_apply_yaml(path)
-    } else if !args.display.is_empty() || !args.qs_role.is_empty() {
+    } else if !args.display.is_empty() || !args.qs_role.is_empty() || args.has_board_settings() {
         cmd_apply_cli(&args)
     } else {
         anyhow::bail!(
@@ -232,13 +245,7 @@ fn cmd_apply_cli(args: &ApplyArgs) -> anyhow::Result<()> {
         }
     }
 
-    let has_board_settings = args.qs_sync_delay.is_some()
-        || args.qs_polarity.is_some()
-        || args.qs_house_sync.is_some()
-        || args.qs_enable
-        || args.qs_disable;
-
-    let quadro_sync = if has_board_settings {
+    let quadro_sync = if args.has_board_settings() {
         Some(QuadroSyncConfig {
             sync_delay: args.qs_sync_delay,
             polarity: args.qs_polarity.as_deref().map(parse_qs_polarity).transpose()?,
@@ -399,5 +406,56 @@ mod tests {
         assert_eq!(parse_qs_house_sync("input").unwrap(), HouseSyncMode::Input);
         assert_eq!(parse_qs_house_sync("output").unwrap(), HouseSyncMode::Output);
         assert!(parse_qs_house_sync("both").is_err());
+    }
+
+    fn empty_apply_args() -> ApplyArgs {
+        ApplyArgs {
+            config: None,
+            display: Vec::new(),
+            mode: Vec::new(),
+            qs_role: Vec::new(),
+            qs_sync_delay: None,
+            qs_polarity: None,
+            qs_house_sync: None,
+            qs_enable: false,
+            qs_disable: false,
+        }
+    }
+
+    #[test]
+    fn has_board_settings_detects_each_flag() {
+        assert!(!empty_apply_args().has_board_settings());
+
+        let mut args = empty_apply_args();
+        args.qs_sync_delay = Some(5);
+        assert!(args.has_board_settings());
+
+        let mut args = empty_apply_args();
+        args.qs_polarity = Some("rising_edge".into());
+        assert!(args.has_board_settings());
+
+        let mut args = empty_apply_args();
+        args.qs_house_sync = Some("input".into());
+        assert!(args.has_board_settings());
+
+        let mut args = empty_apply_args();
+        args.qs_enable = true;
+        assert!(args.has_board_settings());
+
+        let mut args = empty_apply_args();
+        args.qs_disable = true;
+        assert!(args.has_board_settings());
+    }
+
+    #[test]
+    fn board_settings_only_invocation_parses_and_is_accepted() {
+        let cli = Cli::try_parse_from(["dcs-tool", "apply", "--qs-enable"]).unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected apply subcommand");
+        };
+        assert!(args.display.is_empty());
+        assert!(args.qs_role.is_empty());
+        // The cmd_apply gate accepts this invocation via has_board_settings.
+        assert!(args.has_board_settings());
     }
 }

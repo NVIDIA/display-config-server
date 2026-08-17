@@ -48,9 +48,15 @@ pub enum HouseSyncMode {
 /// Board-level QuadroSync settings for one topology commit.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuadroSyncConfig {
+    /// Sync delay.  `None` leaves the current setting unchanged.
     pub sync_delay: Option<u32>,
+    /// Sync signal polarity.  `None` leaves the current setting unchanged.
     pub polarity: Option<QuadroSyncPolarity>,
+    /// House sync mode.  `None` leaves the current setting unchanged.
     pub house_sync_mode: Option<HouseSyncMode>,
+    /// Whether frame sync is enabled.  Unlike the other fields, `None` does
+    /// NOT leave the current setting unchanged: when QuadroSync settings are
+    /// applied with `sync_enable` unset, the server treats it as disabled.
     pub sync_enable: Option<bool>,
 }
 
