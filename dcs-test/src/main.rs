@@ -12,9 +12,12 @@
 //! - **Vulkan** (default): additionally enumerates displays via
 //!   VK_KHR_display and cross-checks the modes against the DCS protocol.
 //!   Falls back to protocol-only if Vulkan is not available.
+//!
+//! - **vulkan-sample**: Present a color cycle to all displays (Vulkan D2D).
 
 mod dcs_protocol;
 mod vulkan;
+mod vulkan_sample;
 
 use std::process::ExitCode;
 
@@ -184,9 +187,28 @@ fn run_crosscheck(
 }
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(String::as_str) == Some("vulkan-sample") {
+        let opts = match vulkan_sample::parse_args(&args[1..]) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return ExitCode::from(2);
+            }
+        };
+        return match vulkan_sample::run(&opts) {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                ExitCode::from(1)
+            }
+        };
+    }
+
     let mut protocol_only = false;
 
-    for arg in std::env::args().skip(1) {
+    for arg in &args {
         match arg.as_str() {
             "--protocol-only" => protocol_only = true,
             "--help" | "-h" => {
@@ -198,6 +220,11 @@ fn main() -> ExitCode {
                 eprintln!("Options:");
                 eprintln!("  --protocol-only   Skip Vulkan tests, only check DCS protocol");
                 eprintln!("  --help            Show this help");
+                eprintln!();
+                eprintln!("Subcommands:");
+                eprintln!("  vulkan-sample     Present a color cycle to all displays (Vulkan D2D)");
+                eprintln!("    --duration N          Exit after N seconds (default: run until Ctrl+C)");
+                eprintln!("    --present-barrier     Synchronize presents with VK_NV_present_barrier");
                 return ExitCode::from(0);
             }
             other => {
