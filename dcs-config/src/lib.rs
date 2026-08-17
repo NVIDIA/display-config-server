@@ -16,4 +16,4 @@ pub use config::{
     QuadroSyncPolarity, QuadroSyncRole, TopologyConfig,
 };
 pub use connection::DcsClient;
-pub use output::{ModeInfo, OutputInfo};
+pub use output::{ModeInfo, OutputInfo, QuadroSyncOutputInfo};

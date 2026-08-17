@@ -4,6 +4,7 @@
 
 use anyhow::Context;
 
+use crate::config::QuadroSyncRole;
 use crate::connection::{BoundOutput, DcsClient, PendingOutput};
 
 /// One display mode reported by the server.
@@ -19,6 +20,15 @@ pub struct ModeInfo {
     pub preferred: bool,
 }
 
+/// QuadroSync state of one display, as reported by the server.
+#[derive(Debug, Clone)]
+pub struct QuadroSyncOutputInfo {
+    /// Current framelock role.
+    pub role: QuadroSyncRole,
+    /// True if framelock sync is currently active on this display.
+    pub sync_active: bool,
+}
+
 /// Current state of one DCS-managed display, as reported by the server.
 #[derive(Debug, Clone)]
 pub struct OutputInfo {
@@ -28,6 +38,8 @@ pub struct OutputInfo {
     pub dev_t: u32,
     /// All modes reported by the server for this output.
     pub modes: Vec<ModeInfo>,
+    /// QuadroSync state; `None` if QuadroSync hardware is not present.
+    pub quadro_sync: Option<QuadroSyncOutputInfo>,
 }
 
 impl OutputInfo {
@@ -60,8 +72,12 @@ impl DcsClient {
 
         // Request DCS output info for each wl_output.  User data = index so
         // the Dispatch<ZwpDcsOutput, usize> impl knows which slot to fill.
+        let qs_manager = self.state.quadro_sync_manager.clone();
         for (i, wl_output) in wl_outputs.iter().enumerate() {
-            manager.get_output(wl_output, &self.qh, i);
+            let dcs_out = manager.get_output(wl_output, &self.qh, i);
+            if let Some(qs) = &qs_manager {
+                qs.get_output(&dcs_out, &self.qh, i);
+            }
         }
 
         // Roundtrip: server sends mode/device/number/done for each output.
@@ -81,6 +97,15 @@ impl DcsClient {
                 display_number: pending.display_number.unwrap_or(-1),
                 dev_t: pending.dev_t.unwrap_or(0),
                 modes: pending.modes.clone(),
+                quadro_sync: pending.qs_role.map(|raw| QuadroSyncOutputInfo {
+                    // role enum: 0 = disabled, 1 = server, 2 = client.
+                    role: match raw {
+                        1 => QuadroSyncRole::Server,
+                        2 => QuadroSyncRole::Client,
+                        _ => QuadroSyncRole::Disabled,
+                    },
+                    sync_active: pending.qs_sync_active.unwrap_or(false),
+                }),
             };
             bound.push(BoundOutput {
                 wl_output: wl_output.clone(),
