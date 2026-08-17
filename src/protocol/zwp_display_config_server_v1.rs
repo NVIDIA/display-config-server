@@ -39,7 +39,10 @@ use crate::protocols::zwp_display_config_server_v1::{
     zwp_dcs_output::{self, Mode as OutputMode, ZwpDcsOutput},
     zwp_dcs_topology::{self, Error as TopologyError, ZwpDcsTopology},
 };
-use crate::protocols::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_topology::ZwpDcsQuadroSyncTopology;
+use crate::protocols::zwp_dcs_quadro_sync_v1::{
+    zwp_dcs_quadro_sync_display_configuration::ZwpDcsQuadroSyncDisplayConfiguration,
+    zwp_dcs_quadro_sync_topology::ZwpDcsQuadroSyncTopology,
+};
 use crate::DcsState;
 
 // ---------------------------------------------------------------------------
@@ -78,6 +81,11 @@ pub struct WlDcsDisplayConfiguration {
     /// Pending display number from `set_number`.
     /// `None` means the display number is not being changed in this commit.
     pub pending_number: Option<u32>,
+    /// Optional QuadroSync display configuration extension, set when a client
+    /// calls `zwp_dcs_quadro_sync_output.get_configuration(this_config)`.
+    /// Collected at commit time so staged QuadroSync roles reach
+    /// [`DcsState::build_quadro_sync_attribute`].
+    pub quadro_sync_config: Option<ZwpDcsQuadroSyncDisplayConfiguration>,
 }
 
 /// Per-resource state for a `zwp_dcs_topology` protocol object.
@@ -198,6 +206,7 @@ impl Dispatch<ZwpDcsOutput, WlDcsOutput> for DcsState {
                         crtc: data.crtc,
                         pending_mode: None,
                         pending_number: None,
+                        quadro_sync_config: None,
                     }),
                 );
             }
@@ -320,9 +329,21 @@ impl DcsState {
 
         // If a QuadroSync topology extension is associated with this topology,
         // build its attribute and stage it into pending_commit before processing
-        // the base configurations.
+        // the base configurations. The QuadroSync display configurations are
+        // reached through the base configurations registered on this topology:
+        // each one that was extended via `get_configuration` carries its
+        // QuadroSync companion in its user data.
         if let Some(ref qs_topo) = topology.quadro_sync_topology {
-            self.build_quadro_sync_attribute(qs_topo)
+            let qs_configs: Vec<ZwpDcsQuadroSyncDisplayConfiguration> = topology
+                .configurations
+                .iter()
+                .filter_map(|config| {
+                    config
+                        .data::<Mutex<WlDcsDisplayConfiguration>>()
+                        .and_then(|d| d.lock().unwrap().quadro_sync_config.clone())
+                })
+                .collect();
+            self.build_quadro_sync_attribute(qs_topo, &qs_configs)
                 .map_err(|e| (0, e))?;
         }
 

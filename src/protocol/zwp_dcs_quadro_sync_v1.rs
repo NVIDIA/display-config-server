@@ -23,7 +23,7 @@ use crate::protocols::zwp_dcs_quadro_sync_v1::{
     },
 };
 use wayland_server::WEnum;
-use crate::protocol::zwp_display_config_server_v1::WlDcsOutput;
+use crate::protocol::zwp_display_config_server_v1::{WlDcsDisplayConfiguration, WlDcsOutput};
 use crate::DcsState;
 
 // ---------------------------------------------------------------------------
@@ -52,8 +52,6 @@ pub struct WlQuadroSyncTopology {
     pub pending_polarity: Option<QuadroSyncPolarity>,
     pub pending_house_sync_mode: Option<HouseSyncMode>,
     pub pending_sync_enable: Option<bool>,
-    /// QuadroSync display configurations associated with this topology.
-    pub configurations: Vec<ZwpDcsQuadroSyncDisplayConfiguration>,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +106,6 @@ impl Dispatch<ZwpDcsQuadroSyncManager, ()> for DcsState {
                         pending_polarity: None,
                         pending_house_sync_mode: None,
                         pending_sync_enable: None,
-                        configurations: Vec::new(),
                     }),
                 );
 
@@ -139,12 +136,12 @@ impl Dispatch<ZwpDcsQuadroSyncOutput, WlQuadroSyncOutput> for DcsState {
         data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
-            zwp_dcs_quadro_sync_output::Request::GetConfiguration { id, config: _ } => {
+            zwp_dcs_quadro_sync_output::Request::GetConfiguration { id, config } => {
                 let crtc = data.crtc;
 
                 // connector_id is resolved during commit via the CRTC handle;
                 // nothing to look up here without DcsState access.
-                data_init.init(
+                let qs_config = data_init.init(
                     id,
                     Mutex::new(WlQuadroSyncDisplayConfiguration {
                         crtc,
@@ -152,6 +149,18 @@ impl Dispatch<ZwpDcsQuadroSyncOutput, WlQuadroSyncOutput> for DcsState {
                         pending_role: None,
                     }),
                 );
+
+                // Stash this QuadroSync configuration in the base display
+                // configuration's user data so the base topology's commit
+                // handler can collect it via the registered configurations.
+                if let Some(base_data) = config.data::<Mutex<WlDcsDisplayConfiguration>>() {
+                    base_data.lock().unwrap().quadro_sync_config = Some(qs_config);
+                } else {
+                    tracing::warn!(
+                        "get_configuration: base display configuration has no user data; \
+                         staged QuadroSync role will be ignored at commit"
+                    );
+                }
             }
         }
     }
@@ -245,13 +254,19 @@ impl Dispatch<ZwpDcsQuadroSyncTopology, Mutex<WlQuadroSyncTopology>> for DcsStat
 
 impl DcsState {
     /// Build a [`QuadroSyncTopologyAttribute`] from the QuadroSync topology
-    /// resource associated with the given base topology, if any, and push it
-    /// into `pending_commit`.
+    /// resource associated with the given base topology and push it into
+    /// `pending_commit`.
+    ///
+    /// `qs_configs` are the QuadroSync display configurations collected from
+    /// the base topology's registered configurations at commit time (each base
+    /// configuration extended via `get_configuration` carries its QuadroSync
+    /// companion in its user data).
     ///
     /// Called by the base topology's `Commit` handler before `apply_topology`.
     pub fn build_quadro_sync_attribute(
         &mut self,
         qs_topo_resource: &ZwpDcsQuadroSyncTopology,
+        qs_configs: &[ZwpDcsQuadroSyncDisplayConfiguration],
     ) -> anyhow::Result<()> {
         use crate::attribute::PendingCommit;
 
@@ -263,7 +278,7 @@ impl DcsState {
 
         let mut roles = Vec::new();
 
-        for qs_config_resource in &topo.configurations {
+        for qs_config_resource in qs_configs {
             let qs_config = qs_config_resource
                 .data::<Mutex<WlQuadroSyncDisplayConfiguration>>()
                 .ok_or_else(|| {
