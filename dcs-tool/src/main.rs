@@ -9,6 +9,8 @@
 //! dcs-tool apply --config /etc/dcs/config.yaml
 //! dcs-tool apply --display 1 --mode 1920x1080@60000
 //! dcs-tool apply --display 1 --mode 1920x1080@60000 --display 2 --mode 1920x1080@60000
+//! dcs-tool apply --display 1 --mode 1920x1080@60000 --display 2 --mode 1920x1080@60000 \
+//!                --qs-role 1=server --qs-role 2=client --qs-enable
 //! ```
 
 use std::path::PathBuf;
@@ -18,7 +20,10 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
 use dcs_config::{
-    config::{Config, DisplayConfig, ModeConfig, TopologyConfig},
+    config::{
+        Config, DisplayConfig, HouseSyncMode, ModeConfig, QuadroSyncConfig,
+        QuadroSyncPolarity, QuadroSyncRole, TopologyConfig,
+    },
     connection::connect,
 };
 
@@ -58,6 +63,30 @@ struct ApplyArgs {
     /// Mode as WxH@R in mHz, e.g. 1920x1080@60000 (paired with --display)
     #[arg(long = "mode")]
     mode: Vec<String>,
+
+    /// QuadroSync role as N=disabled|server|client (may be repeated)
+    #[arg(long = "qs-role", conflicts_with = "config")]
+    qs_role: Vec<String>,
+
+    /// QuadroSync sync delay
+    #[arg(long = "qs-sync-delay", conflicts_with = "config")]
+    qs_sync_delay: Option<u32>,
+
+    /// QuadroSync polarity: rising_edge|falling_edge|both_edges
+    #[arg(long = "qs-polarity", conflicts_with = "config")]
+    qs_polarity: Option<String>,
+
+    /// QuadroSync house sync mode: disabled|input|output
+    #[arg(long = "qs-house-sync", conflicts_with = "config")]
+    qs_house_sync: Option<String>,
+
+    /// Enable QuadroSync sync
+    #[arg(long = "qs-enable", conflicts_with_all = &["config", "qs_disable"])]
+    qs_enable: bool,
+
+    /// Disable QuadroSync sync
+    #[arg(long = "qs-disable", conflicts_with = "config")]
+    qs_disable: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +147,16 @@ fn cmd_show() -> anyhow::Result<()> {
                     );
                 }
             }
+
+            if let Some(qs) = &output.quadro_sync {
+                let role = match qs.role {
+                    QuadroSyncRole::Disabled => "disabled",
+                    QuadroSyncRole::Server => "server",
+                    QuadroSyncRole::Client => "client",
+                };
+                let sync = if qs.sync_active { "active" } else { "inactive" };
+                println!("  QuadroSync role: {}, sync: {}", role, sync);
+            }
         }
     }
 
@@ -133,10 +172,13 @@ fn cmd_show() -> anyhow::Result<()> {
 fn cmd_apply(args: ApplyArgs) -> anyhow::Result<()> {
     if let Some(path) = &args.config {
         cmd_apply_yaml(path)
-    } else if !args.display.is_empty() {
-        cmd_apply_cli(&args.display, &args.mode)
+    } else if !args.display.is_empty() || !args.qs_role.is_empty() {
+        cmd_apply_cli(&args)
     } else {
-        anyhow::bail!("specify --config FILE or one or more --display N --mode WxH@R pairs")
+        anyhow::bail!(
+            "specify --config FILE, one or more --display N --mode WxH@R pairs, \
+             or --qs-* flags"
+        )
     }
 }
 
@@ -154,31 +196,117 @@ fn cmd_apply_yaml(path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_apply_cli(displays: &[u32], modes: &[String]) -> anyhow::Result<()> {
-    if displays.len() != modes.len() {
+fn cmd_apply_cli(args: &ApplyArgs) -> anyhow::Result<()> {
+    if args.display.len() != args.mode.len() {
         anyhow::bail!(
             "--display and --mode must appear in pairs (got {} displays, {} modes)",
-            displays.len(),
-            modes.len()
+            args.display.len(),
+            args.mode.len()
         );
     }
 
-    let display_configs: Vec<DisplayConfig> = displays
+    let mut display_configs: Vec<DisplayConfig> = args
+        .display
         .iter()
-        .zip(modes.iter())
+        .zip(args.mode.iter())
         .map(|(number, mode_str)| {
             Ok(DisplayConfig {
                 number: *number,
                 mode: Some(parse_mode(mode_str)?),
+                quadro_sync_role: None,
             })
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let topology = TopologyConfig { display: display_configs };
+    // Attach roles to existing display entries, or add role-only entries for
+    // displays that appear in --qs-role but not in --display.
+    for role_str in &args.qs_role {
+        let (number, role) = parse_qs_role(role_str)?;
+        match display_configs.iter_mut().find(|d| d.number == number) {
+            Some(d) => d.quadro_sync_role = Some(role),
+            None => display_configs.push(DisplayConfig {
+                number,
+                mode: None,
+                quadro_sync_role: Some(role),
+            }),
+        }
+    }
+
+    let has_board_settings = args.qs_sync_delay.is_some()
+        || args.qs_polarity.is_some()
+        || args.qs_house_sync.is_some()
+        || args.qs_enable
+        || args.qs_disable;
+
+    let quadro_sync = if has_board_settings {
+        Some(QuadroSyncConfig {
+            sync_delay: args.qs_sync_delay,
+            polarity: args.qs_polarity.as_deref().map(parse_qs_polarity).transpose()?,
+            house_sync_mode: args
+                .qs_house_sync
+                .as_deref()
+                .map(parse_qs_house_sync)
+                .transpose()?,
+            sync_enable: if args.qs_enable {
+                Some(true)
+            } else if args.qs_disable {
+                Some(false)
+            } else {
+                None
+            },
+        })
+    } else {
+        None
+    };
+
+    let topology = TopologyConfig { display: display_configs, quadro_sync };
     let mut client = connect()?;
     client.apply(&topology)?;
     println!("Configuration applied successfully.");
     Ok(())
+}
+
+/// Parse a `--qs-role` value in the form `N=disabled|server|client`.
+fn parse_qs_role(s: &str) -> anyhow::Result<(u32, QuadroSyncRole)> {
+    let (num_str, role_str) = s
+        .split_once('=')
+        .with_context(|| format!("invalid --qs-role '{s}': expected N=role (e.g. 1=server)"))?;
+    let number: u32 = num_str
+        .parse()
+        .with_context(|| format!("invalid display number in '{s}'"))?;
+    let role = match role_str {
+        "disabled" => QuadroSyncRole::Disabled,
+        "server" => QuadroSyncRole::Server,
+        "client" => QuadroSyncRole::Client,
+        other => anyhow::bail!(
+            "invalid QuadroSync role '{other}': expected disabled, server, or client"
+        ),
+    };
+    Ok((number, role))
+}
+
+/// Parse a `--qs-polarity` value.
+fn parse_qs_polarity(s: &str) -> anyhow::Result<QuadroSyncPolarity> {
+    match s {
+        "rising_edge" => Ok(QuadroSyncPolarity::RisingEdge),
+        "falling_edge" => Ok(QuadroSyncPolarity::FallingEdge),
+        "both_edges" => Ok(QuadroSyncPolarity::BothEdges),
+        other => anyhow::bail!(
+            "invalid polarity '{other}': expected rising_edge, falling_edge, or both_edges"
+        ),
+    }
+}
+
+/// Parse a `--qs-house-sync` value.
+fn parse_qs_house_sync(s: &str) -> anyhow::Result<HouseSyncMode> {
+    match s {
+        "disabled" => Ok(HouseSyncMode::Disabled),
+        "input" => Ok(HouseSyncMode::Input),
+        "output" => Ok(HouseSyncMode::Output),
+        other => anyhow::bail!(
+            "invalid house sync mode '{other}': expected disabled, input, or output"
+        ),
+    }
 }
 
 /// Parse a mode string in the form `WxH@R` where R is in mHz.
@@ -241,5 +369,35 @@ mod tests {
     fn parse_mode_mhz_suffix() {
         let m = parse_mode("1920x1080@60000mHz").unwrap();
         assert_eq!(m.refresh_mhz, 60000);
+    }
+
+    #[test]
+    fn parse_qs_role_valid() {
+        assert_eq!(parse_qs_role("1=server").unwrap(), (1, QuadroSyncRole::Server));
+        assert_eq!(parse_qs_role("2=client").unwrap(), (2, QuadroSyncRole::Client));
+        assert_eq!(parse_qs_role("3=disabled").unwrap(), (3, QuadroSyncRole::Disabled));
+    }
+
+    #[test]
+    fn parse_qs_role_invalid() {
+        assert!(parse_qs_role("1=admin").is_err());
+        assert!(parse_qs_role("server").is_err());
+        assert!(parse_qs_role("x=server").is_err());
+    }
+
+    #[test]
+    fn parse_qs_polarity_valid() {
+        assert_eq!(parse_qs_polarity("rising_edge").unwrap(), QuadroSyncPolarity::RisingEdge);
+        assert_eq!(parse_qs_polarity("falling_edge").unwrap(), QuadroSyncPolarity::FallingEdge);
+        assert_eq!(parse_qs_polarity("both_edges").unwrap(), QuadroSyncPolarity::BothEdges);
+        assert!(parse_qs_polarity("sideways").is_err());
+    }
+
+    #[test]
+    fn parse_qs_house_sync_valid() {
+        assert_eq!(parse_qs_house_sync("disabled").unwrap(), HouseSyncMode::Disabled);
+        assert_eq!(parse_qs_house_sync("input").unwrap(), HouseSyncMode::Input);
+        assert_eq!(parse_qs_house_sync("output").unwrap(), HouseSyncMode::Output);
+        assert!(parse_qs_house_sync("both").is_err());
     }
 }
