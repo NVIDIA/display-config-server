@@ -15,6 +15,14 @@ use crate::protocol::zwp_display_config_server_v1::{
     zwp_dcs_output::{self, ZwpDcsOutput},
     zwp_dcs_topology::{self, ZwpDcsTopology},
 };
+use crate::protocol::zwp_dcs_quadro_sync_v1::{
+    zwp_dcs_quadro_sync_display_configuration::{
+        self, ZwpDcsQuadroSyncDisplayConfiguration,
+    },
+    zwp_dcs_quadro_sync_manager::{self, ZwpDcsQuadroSyncManager},
+    zwp_dcs_quadro_sync_output::{self, ZwpDcsQuadroSyncOutput},
+    zwp_dcs_quadro_sync_topology::{self, ZwpDcsQuadroSyncTopology},
+};
 
 /// The default DCS Wayland socket name.
 const DCS_SOCKET: &str = "display-config-server-0";
@@ -30,6 +38,10 @@ pub(crate) struct PendingOutput {
     pub dev_t: Option<u32>,
     pub modes: Vec<ModeInfo>,
     pub done: bool,
+    /// QuadroSync role raw value (0=disabled, 1=server, 2=client), if reported.
+    pub qs_role: Option<u32>,
+    /// Whether QuadroSync sync is currently active, if reported.
+    pub qs_sync_active: Option<bool>,
 }
 
 /// A fully-resolved output: the raw `wl_output` proxy (needed for
@@ -48,8 +60,9 @@ pub(crate) struct ClientState {
     pub wl_outputs: Vec<WlOutput>,
     /// Set to true if `wp_drm_lease_device_v1` is advertised.
     pub drm_lease_found: bool,
-    /// Set to true if `zwp_dcs_quadro_sync_manager` is advertised.
-    pub quadro_sync_found: bool,
+    /// Bound if `zwp_dcs_quadro_sync_manager` is advertised (QuadroSync
+    /// hardware detected by DCS).
+    pub quadro_sync_manager: Option<ZwpDcsQuadroSyncManager>,
     /// Temporary output slots, indexed by position in `wl_outputs`,
     /// populated during `enumerate_outputs`.
     pub pending: Vec<PendingOutput>,
@@ -85,7 +98,7 @@ impl DcsClient {
 
     /// Returns true if QuadroSync hardware was detected by DCS.
     pub fn quadro_sync_supported(&self) -> bool {
-        self.state.quadro_sync_found
+        self.state.quadro_sync_manager.is_some()
     }
 }
 
@@ -110,7 +123,7 @@ pub fn connect() -> anyhow::Result<DcsClient> {
         manager_raw: None,
         wl_outputs: Vec::new(),
         drm_lease_found: false,
-        quadro_sync_found: false,
+        quadro_sync_manager: None,
         pending: Vec::new(),
         bound_outputs: Vec::new(),
         topology_error: false,
@@ -157,7 +170,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                     state.drm_lease_found = true;
                 }
                 "zwp_dcs_quadro_sync_manager" => {
-                    state.quadro_sync_found = true;
+                    let mgr: ZwpDcsQuadroSyncManager = registry.bind(name, 1, qh, ());
+                    state.quadro_sync_manager = Some(mgr);
                 }
                 _ => {}
             }
@@ -272,5 +286,83 @@ impl Dispatch<ZwpDcsDisplayConfiguration, ()> for ClientState {
                 state.config_error = true;
             }
         }
+    }
+}
+
+impl Dispatch<ZwpDcsQuadroSyncManager, ()> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _: &ZwpDcsQuadroSyncManager,
+        _event: zwp_dcs_quadro_sync_manager::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // zwp_dcs_quadro_sync_manager has no events in v1.
+    }
+}
+
+/// User data = index into `state.pending`; populated during `enumerate_outputs`.
+impl Dispatch<ZwpDcsQuadroSyncOutput, usize> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwpDcsQuadroSyncOutput,
+        event: zwp_dcs_quadro_sync_output::Event,
+        index: &usize,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let Some(pending) = state.pending.get_mut(*index) else { return };
+        match event {
+            zwp_dcs_quadro_sync_output::Event::SyncStatus { enabled } => {
+                pending.qs_sync_active = Some(enabled != 0);
+            }
+            zwp_dcs_quadro_sync_output::Event::Role { role } => {
+                pending.qs_role = Some(role.into());
+            }
+            zwp_dcs_quadro_sync_output::Event::Done => {}
+        }
+    }
+}
+
+/// User data = `()` for QuadroSync outputs created during `apply` (events ignored).
+impl Dispatch<ZwpDcsQuadroSyncOutput, ()> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _: &ZwpDcsQuadroSyncOutput,
+        _event: zwp_dcs_quadro_sync_output::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // Events from QuadroSync outputs created in apply() are not needed.
+    }
+}
+
+impl Dispatch<ZwpDcsQuadroSyncDisplayConfiguration, ()> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _: &ZwpDcsQuadroSyncDisplayConfiguration,
+        _event: zwp_dcs_quadro_sync_display_configuration::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // zwp_dcs_quadro_sync_display_configuration has no events in v1.
+        // Commit errors surface through the base protocol's error events.
+    }
+}
+
+impl Dispatch<ZwpDcsQuadroSyncTopology, ()> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _: &ZwpDcsQuadroSyncTopology,
+        _event: zwp_dcs_quadro_sync_topology::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // zwp_dcs_quadro_sync_topology has no events in v1.
+        // Commit errors surface through the base protocol's error events.
     }
 }
