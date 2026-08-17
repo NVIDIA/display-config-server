@@ -7,6 +7,7 @@
 //! Relies on the NVIDIA driver's transparent DCS lease integration — no
 //! Wayland lease protocol code here.
 
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -77,8 +78,15 @@ pub(crate) fn frame_color(elapsed_secs: f32) -> [f32; 4] {
 /// Cleared by the SIGINT handler; the present loop polls it.
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
+/// Signal handler: request a clean stop, then restore the default SIGINT
+/// disposition. If the present loop is blocked in a driver call (e.g.
+/// `acquire_next_image` with a `u64::MAX` timeout, or `queue_wait_idle`
+/// stalled by a broken present-barrier group) it will never observe
+/// `RUNNING`, so a second Ctrl+C must be able to terminate the process the
+/// normal way instead of being swallowed by this handler again.
 extern "C" fn on_sigint(_signum: i32) {
     RUNNING.store(false, Ordering::SeqCst);
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
 }
 
 /// One display we present to: its surface, swapchain, and sync objects.
@@ -117,7 +125,12 @@ pub fn run(opts: &SampleOptions) -> Result<(), Box<dyn std::error::Error>> {
     let instance_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
         .enabled_extension_names(&instance_exts);
-    let instance = unsafe { entry.create_instance(&instance_info, None) }?;
+    let instance = unsafe { entry.create_instance(&instance_info, None) }.map_err(|e| {
+        format!(
+            "failed to create Vulkan instance (is a driver with VK_KHR_display available?): {}",
+            e
+        )
+    })?;
 
     let result = run_with_instance(opts, &entry, &instance);
     unsafe { instance.destroy_instance(None) };
@@ -157,7 +170,8 @@ fn run_with_instance(
     // --- present loop ---
     unsafe { libc::signal(libc::SIGINT, on_sigint as extern "C" fn(i32) as usize) };
     println!(
-        "vulkan-sample: cycling color on {} display(s){} — Ctrl+C to stop",
+        "vulkan-sample: cycling color on {} display(s){} — Ctrl+C to stop \
+         (press twice if a stalled present barrier keeps the first from taking effect)",
         total_displays,
         if opts.present_barrier { " with present barrier" } else { "" }
     );
@@ -253,6 +267,10 @@ fn try_setup_device(
         return Ok(None);
     }
     let plane_props = unsafe { display_fn.get_physical_device_display_plane_properties(phys) }?;
+    // Planes already assigned to an earlier display in this loop — some
+    // hardware reports a plane as supporting multiple displays, but each
+    // plane can only drive one display at a time.
+    let mut claimed_planes: HashSet<u32> = HashSet::new();
 
     for dp in &display_props {
         let name = if dp.display_name.is_null() {
@@ -268,19 +286,34 @@ fn try_setup_device(
             .first()
             .ok_or_else(|| format!("{}: no display modes", name))?;
 
-        // Find a plane that supports this display.
+        // Find a plane that supports this display and isn't already claimed
+        // by an earlier display on this device. Prefer a plane whose
+        // current_display already matches (or is unset), falling back to
+        // any other unclaimed, supporting plane.
         let mut plane_index = None;
-        for (i, _) in plane_props.iter().enumerate() {
-            let supported = unsafe {
-                display_fn.get_display_plane_supported_displays(phys, i as u32)
-            }?;
-            if supported.contains(&dp.display) {
-                plane_index = Some(i as u32);
+        let mut fallback_index = None;
+        for (i, pp) in plane_props.iter().enumerate() {
+            let i = i as u32;
+            if claimed_planes.contains(&i) {
+                continue;
+            }
+            let supported =
+                unsafe { display_fn.get_display_plane_supported_displays(phys, i) }?;
+            if !supported.contains(&dp.display) {
+                continue;
+            }
+            if pp.current_display == dp.display || pp.current_display == vk::DisplayKHR::null() {
+                plane_index = Some(i);
                 break;
             }
+            if fallback_index.is_none() {
+                fallback_index = Some(i);
+            }
         }
-        let plane_index = plane_index
-            .ok_or_else(|| format!("{}: no compatible display plane", name))?;
+        let plane_index = plane_index.or(fallback_index).ok_or_else(|| {
+            format!("{}: no compatible display plane available (all claimed by other displays on this GPU)", name)
+        })?;
+        claimed_planes.insert(plane_index);
 
         let surface_info = vk::DisplaySurfaceCreateInfoKHR::default()
             .display_mode(mode.display_mode)

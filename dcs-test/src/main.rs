@@ -190,7 +190,19 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.first().map(String::as_str) == Some("vulkan-sample") {
-        let opts = match vulkan_sample::parse_args(&args[1..]) {
+        let sub_args = &args[1..];
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            eprintln!("Usage: dcs-test vulkan-sample [OPTIONS]");
+            eprintln!();
+            eprintln!("Presents a color cycle to all VK_KHR_display displays.");
+            eprintln!();
+            eprintln!("Options:");
+            eprintln!("  --duration N          Exit after N seconds (default: run until Ctrl+C)");
+            eprintln!("  --present-barrier     Synchronize presents with VK_NV_present_barrier");
+            eprintln!("  --help                Show this help");
+            return ExitCode::from(0);
+        }
+        let opts = match vulkan_sample::parse_args(sub_args) {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("error: {}", e);
