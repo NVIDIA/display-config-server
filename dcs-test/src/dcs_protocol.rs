@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! DCS protocol connectivity check for dcs-test.
 //!
-//! Delegates to `dcs-config` for connection management so the protocol
+//! Delegates to `dcs-client` for connection management so the protocol
 //! binding code is not duplicated.
 
 /// Summary of DCS Wayland globals detected during the connection roundtrip.
@@ -21,7 +21,7 @@ pub struct DcsProtocolState {
 /// fails (DCS not running), returns `Ok` with `manager_found = false` so
 /// dcs-test can report a failure rather than propagating an error.
 pub fn query_dcs() -> Result<DcsProtocolState, Box<dyn std::error::Error>> {
-    match dcs_config::connection::connect() {
+    match dcs_client::connection::connect() {
         Ok(client) => Ok(DcsProtocolState {
             manager_found: true,
             drm_lease_found: client.drm_lease_found(),

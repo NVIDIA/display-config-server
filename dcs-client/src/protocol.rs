@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Generated client-side bindings for the DCS private Wayland protocol.
 //!
-//! Re-exported from `dcs_config::protocol` for use by connection and apply
+//! Re-exported from `dcs_client::protocol` for use by connection and apply
 //! modules.  The path `"../protocol/..."` is relative to the crate root.
 
 pub mod zwp_display_config_server_v1 {

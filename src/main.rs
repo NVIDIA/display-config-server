@@ -372,7 +372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Advertise one wl_output global per connected display so that
-    // dcs-config clients can call zwp_dcs_manager.get_output().
+    // dcs-client clients can call zwp_dcs_manager.get_output().
     // The crtc::Handle is stored as global data and resolved by the
     // get_output handler via output.data::<crtc::Handle>().
     {

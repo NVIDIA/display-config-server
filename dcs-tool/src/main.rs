@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! dcs-tool — Display Config Server configuration tool.
 //!
+//! dcs-tool is the command line configuration tool used to control displays owned
+//! by Display Config Server. dcs-tool allows for dynamic configuration via a set
+//! of CLI arguments and also supports reading from a configuration file.
+//!
 //! # Usage
 //!
 //! ```text
@@ -19,10 +23,10 @@ use std::process::ExitCode;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
-use dcs_config::{
+use dcs_client::{
     config::{
-        Config, DisplayConfig, HouseSyncMode, ModeConfig, QuadroSyncConfig,
-        QuadroSyncPolarity, QuadroSyncRole, TopologyConfig,
+        Config, DisplayConfig, HouseSyncMode, ModeConfig, QuadroSyncConfig, QuadroSyncPolarity,
+        QuadroSyncRole, TopologyConfig,
     },
     connection::connect,
 };
@@ -144,15 +148,11 @@ fn cmd_show() -> anyhow::Result<()> {
                 println!("  (no modes)");
             } else {
                 for mode in &output.modes {
-                    let marker = if mode.current {
-                        "  * "
-                    } else {
-                        "    "
-                    };
+                    let marker = if mode.current { "  * " } else { "    " };
                     let tag = match (mode.current, mode.preferred) {
-                        (true, _)      => " [current]",
-                        (false, true)  => " [preferred]",
-                        _              => "",
+                        (true, _) => " [current]",
+                        (false, true) => " [preferred]",
+                        _ => "",
                     };
                     println!(
                         "{}{}x{}@{}mHz{}",
@@ -176,7 +176,11 @@ fn cmd_show() -> anyhow::Result<()> {
     println!();
     println!(
         "QuadroSync: {}",
-        if quadro_sync { "supported" } else { "not detected" }
+        if quadro_sync {
+            "supported"
+        } else {
+            "not detected"
+        }
     );
 
     Ok(())
@@ -248,7 +252,11 @@ fn cmd_apply_cli(args: &ApplyArgs) -> anyhow::Result<()> {
     let quadro_sync = if args.has_board_settings() {
         Some(QuadroSyncConfig {
             sync_delay: args.qs_sync_delay,
-            polarity: args.qs_polarity.as_deref().map(parse_qs_polarity).transpose()?,
+            polarity: args
+                .qs_polarity
+                .as_deref()
+                .map(parse_qs_polarity)
+                .transpose()?,
             house_sync_mode: args
                 .qs_house_sync
                 .as_deref()
@@ -266,7 +274,10 @@ fn cmd_apply_cli(args: &ApplyArgs) -> anyhow::Result<()> {
         None
     };
 
-    let topology = TopologyConfig { display: display_configs, quadro_sync };
+    let topology = TopologyConfig {
+        display: display_configs,
+        quadro_sync,
+    };
     let mut client = connect()?;
     client.apply(&topology)?;
     println!("Configuration applied successfully.");
@@ -285,9 +296,9 @@ fn parse_qs_role(s: &str) -> anyhow::Result<(u32, QuadroSyncRole)> {
         "disabled" => QuadroSyncRole::Disabled,
         "server" => QuadroSyncRole::Server,
         "client" => QuadroSyncRole::Client,
-        other => anyhow::bail!(
-            "invalid QuadroSync role '{other}': expected disabled, server, or client"
-        ),
+        other => {
+            anyhow::bail!("invalid QuadroSync role '{other}': expected disabled, server, or client")
+        }
     };
     Ok((number, role))
 }
@@ -310,9 +321,9 @@ fn parse_qs_house_sync(s: &str) -> anyhow::Result<HouseSyncMode> {
         "disabled" => Ok(HouseSyncMode::Disabled),
         "input" => Ok(HouseSyncMode::Input),
         "output" => Ok(HouseSyncMode::Output),
-        other => anyhow::bail!(
-            "invalid house sync mode '{other}': expected disabled, input, or output"
-        ),
+        other => {
+            anyhow::bail!("invalid house sync mode '{other}': expected disabled, input, or output")
+        }
     }
 }
 
@@ -380,9 +391,18 @@ mod tests {
 
     #[test]
     fn parse_qs_role_valid() {
-        assert_eq!(parse_qs_role("1=server").unwrap(), (1, QuadroSyncRole::Server));
-        assert_eq!(parse_qs_role("2=client").unwrap(), (2, QuadroSyncRole::Client));
-        assert_eq!(parse_qs_role("3=disabled").unwrap(), (3, QuadroSyncRole::Disabled));
+        assert_eq!(
+            parse_qs_role("1=server").unwrap(),
+            (1, QuadroSyncRole::Server)
+        );
+        assert_eq!(
+            parse_qs_role("2=client").unwrap(),
+            (2, QuadroSyncRole::Client)
+        );
+        assert_eq!(
+            parse_qs_role("3=disabled").unwrap(),
+            (3, QuadroSyncRole::Disabled)
+        );
     }
 
     #[test]
@@ -394,17 +414,32 @@ mod tests {
 
     #[test]
     fn parse_qs_polarity_valid() {
-        assert_eq!(parse_qs_polarity("rising_edge").unwrap(), QuadroSyncPolarity::RisingEdge);
-        assert_eq!(parse_qs_polarity("falling_edge").unwrap(), QuadroSyncPolarity::FallingEdge);
-        assert_eq!(parse_qs_polarity("both_edges").unwrap(), QuadroSyncPolarity::BothEdges);
+        assert_eq!(
+            parse_qs_polarity("rising_edge").unwrap(),
+            QuadroSyncPolarity::RisingEdge
+        );
+        assert_eq!(
+            parse_qs_polarity("falling_edge").unwrap(),
+            QuadroSyncPolarity::FallingEdge
+        );
+        assert_eq!(
+            parse_qs_polarity("both_edges").unwrap(),
+            QuadroSyncPolarity::BothEdges
+        );
         assert!(parse_qs_polarity("sideways").is_err());
     }
 
     #[test]
     fn parse_qs_house_sync_valid() {
-        assert_eq!(parse_qs_house_sync("disabled").unwrap(), HouseSyncMode::Disabled);
+        assert_eq!(
+            parse_qs_house_sync("disabled").unwrap(),
+            HouseSyncMode::Disabled
+        );
         assert_eq!(parse_qs_house_sync("input").unwrap(), HouseSyncMode::Input);
-        assert_eq!(parse_qs_house_sync("output").unwrap(), HouseSyncMode::Output);
+        assert_eq!(
+            parse_qs_house_sync("output").unwrap(),
+            HouseSyncMode::Output
+        );
         assert!(parse_qs_house_sync("both").is_err());
     }
 
