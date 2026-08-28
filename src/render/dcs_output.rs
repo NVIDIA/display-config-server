@@ -315,11 +315,31 @@ impl DcsOutput {
     /// kernel CRTC/plane state so smithay's internal bookkeeping matches what
     /// the hardware is doing.  With `SET_PERSISTENT_DISPLAY` enabled the CRTC
     /// stays active (same mode, same connectors) so the subsequent render is a
-    /// page flip — no full modeset, framelock state is preserved.
+    /// page flip — no full modeset, framelock state is preserved.  If the
+    /// client changed the display configuration during the lease, the next
+    /// render performs a modeset to restore the configured mode instead.
     pub fn request_redraw(&mut self) {
         if let Err(e) = self.compositor.reset_state() {
             tracing::warn!("Failed to reset DRM state after lease end: {}", e);
         }
+
+        // After reset_state() the current mode reflects what the hardware is
+        // actually driving, while the pending mode is our configured mode.
+        // If they differ the leased client deviated from the configuration
+        // and the redraw below will have to perform a modeset to restore it.
+        let current = self.compositor.current_mode();
+        let pending = self.compositor.pending_mode();
+        if current != pending {
+            tracing::warn!(
+                "Leased client changed the configuration of display {} (hardware \
+                 is driving {:?}, configured mode is {:?}), performing a modeset \
+                 to restore the requested configuration",
+                self.display_number,
+                current,
+                pending,
+            );
+        }
+
         self.needs_render = true;
     }
 
