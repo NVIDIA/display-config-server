@@ -148,14 +148,9 @@
   <!-- ===================================================================
        zwp_dcs_display_configuration
 
-       This object allows configuring one display in the system. It is part
-       of a broader topology update which controls setting multiple
-       configurations across multiple displays/devices atomically.
-
-       Think of this as a description of display state which will be applied
-       during an atomic topology commit. Only the pieces of state that need
-       to be changed need to be included; omitted values retain their current
-       state.
+       This object allows configuring one display in the system. It is one
+       part of a topology update which describes the updates to a specific
+       display.
        =================================================================== -->
   <interface name="zwp_dcs_display_configuration" version="1">
     <description summary="single display configuration">
@@ -208,11 +203,6 @@
        into one atomic state commit. Configurations represent changes to
        an individual display; the topology represents changes to the entire
        display wall.
-
-       The topology has configurations added to it, then the topology is
-       committed. On failure the topology posts an error event, and the
-       specific display_configuration objects causing the problem receive
-       error events to hint what caused the rejection.
        =================================================================== -->
   <interface name="zwp_dcs_topology" version="1">
     <description summary="multi-display atomic topology commit">

@@ -88,12 +88,15 @@ impl Dispatch<ZwpDcsQuadroSyncManager, ()> for DcsState {
 
                 let resource = data_init.init(id, WlQuadroSyncOutput { crtc });
 
-                // Send initial QuadroSync state for this output.
-                // Hardware query is deferred to future work; send placeholders.
+                // Send the current QuadroSync state for this output, queried
+                // from the hardware.
                 if let Some(crtc_handle) = crtc {
-                    if state.output_for_crtc(crtc_handle).is_some() {
-                        resource.sync_status(0); // not currently synced
-                        resource.role(OutputRole::Disabled);
+                    if let Some(dcs_output) = state.output_for_crtc(crtc_handle) {
+                        let connector_id: u32 = dcs_output.connector_handle.into();
+                        let (role, engaged) = query_output_state(state, crtc_handle, connector_id);
+
+                        resource.sync_status(engaged as u32);
+                        resource.role(role);
                         resource.done();
                     }
                 }
@@ -119,6 +122,57 @@ impl Dispatch<ZwpDcsQuadroSyncManager, ()> for DcsState {
             }
         }
     }
+}
+
+/// Query the hardware for an output's current framelock role and engagement.
+///
+/// Engagement means display sync is enabled on the connector and the board
+/// reports sync ready. Query failures degrade to disabled/not-engaged with a
+/// debug log rather than erroring the protocol request.
+fn query_output_state(
+    state: &DcsState,
+    crtc: crtc::Handle,
+    connector_id: u32,
+) -> (OutputRole, bool) {
+    use std::os::unix::io::{AsFd, AsRawFd};
+
+    use crate::attribute::quadro_sync::{get_display_config, get_display_sync, get_sync_ready};
+
+    let Some(device) = state.device_for_crtc(crtc) else {
+        return (OutputRole::Disabled, false);
+    };
+    let fd = device.drm_device.as_fd().as_raw_fd();
+
+    let role = match get_display_config(fd, connector_id) {
+        Ok(QuadroSyncRole::Server) => OutputRole::Server,
+        Ok(QuadroSyncRole::Client) => OutputRole::Client,
+        Ok(QuadroSyncRole::Disabled) => OutputRole::Disabled,
+        Err(e) => {
+            tracing::debug!(
+                "framelock display config query failed for connector {}: {}",
+                connector_id,
+                e
+            );
+            OutputRole::Disabled
+        }
+    };
+
+    let enabled = get_display_sync(fd, connector_id).unwrap_or_else(|e| {
+        tracing::debug!(
+            "framelock display sync query failed for connector {}: {}",
+            connector_id,
+            e
+        );
+        false
+    });
+
+    let ready = enabled
+        && get_sync_ready(fd, 0).unwrap_or_else(|e| {
+            tracing::debug!("framelock sync ready query failed: {}", e);
+            false
+        });
+
+    (role, enabled && ready)
 }
 
 // ---------------------------------------------------------------------------

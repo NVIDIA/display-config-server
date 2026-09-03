@@ -117,6 +117,11 @@ impl DcsState {
         self.devices.iter_mut().find_map(|d| d.outputs.get_mut(&crtc))
     }
 
+    /// Find the [`DcsDevice`] that owns the output driving `crtc`.
+    fn device_for_crtc(&self, crtc: drm::control::crtc::Handle) -> Option<&render::DcsDevice> {
+        self.devices.iter().find(|d| d.outputs.contains_key(&crtc))
+    }
+
     /// Test whether the requested mode is accepted by the hardware without
     /// applying it, delegating to the owning [`DcsDevice`].
     fn validate_output_mode_change(

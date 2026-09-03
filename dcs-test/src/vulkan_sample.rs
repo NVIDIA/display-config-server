@@ -482,6 +482,11 @@ fn present_loop(
     start: Instant,
     devices: &[DeviceCtx],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // With FIFO present the loop rate equals the achieved refresh rate, so
+    // count iterations and report once a second to show the present rate.
+    let mut frames = 0u32;
+    let mut last_report = start;
+
     while RUNNING.load(Ordering::SeqCst) {
         let elapsed = start.elapsed();
         if let Some(limit) = opts.duration {
@@ -499,6 +504,17 @@ fn present_loop(
             // Simplicity over throughput: idle the queue each frame so the
             // single command buffer and semaphores can be reused safely.
             unsafe { dev.device.queue_wait_idle(dev.queue) }?;
+        }
+
+        frames += 1;
+        let since_report = last_report.elapsed();
+        if since_report >= Duration::from_secs(1) {
+            println!(
+                "vulkan-sample: {:.1} fps",
+                frames as f64 / since_report.as_secs_f64()
+            );
+            frames = 0;
+            last_report = Instant::now();
         }
     }
     Ok(())

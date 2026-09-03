@@ -20,8 +20,11 @@ const DRM_COMMAND_BASE: u32 = 0x40;
 
 const DRM_NVIDIA_FRAMELOCK_QUERY: u32 = 0x1f;
 const DRM_NVIDIA_FRAMELOCK_SET_ATTRIBUTE: u32 = 0x20;
+const DRM_NVIDIA_FRAMELOCK_GET_ATTRIBUTE: u32 = 0x21;
 const DRM_NVIDIA_FRAMELOCK_SET_DISPLAY_CONFIG: u32 = 0x23;
+const DRM_NVIDIA_FRAMELOCK_GET_DISPLAY_CONFIG: u32 = 0x24;
 const DRM_NVIDIA_FRAMELOCK_SET_DISPLAY_SYNC: u32 = 0x25;
+const DRM_NVIDIA_FRAMELOCK_GET_DISPLAY_SYNC: u32 = 0x26;
 
 const FRAMELOCK_DISPLAY_CONFIG_DISABLED: u32 = 0;
 const FRAMELOCK_DISPLAY_CONFIG_SERVER: u32 = 1;
@@ -52,6 +55,26 @@ struct DrmNvidiaFramelockSetDisplayConfigParams {
 struct DrmNvidiaFramelockSetDisplaySyncParams {
     connector_id: u32,
     enable: u32,
+}
+
+#[repr(C)]
+struct DrmNvidiaFramelockGetAttributeParams {
+    framelock_index: u32,
+    attribute: u32,
+    value: i64,
+    __pad: u32,
+}
+
+#[repr(C)]
+struct DrmNvidiaFramelockGetDisplayConfigParams {
+    connector_id: u32,
+    config: u32,
+}
+
+#[repr(C)]
+struct DrmNvidiaFramelockGetDisplaySyncParams {
+    connector_id: u32,
+    enabled: u32,
 }
 
 /// Build a DRM IOWR ioctl request number.
@@ -152,6 +175,76 @@ impl QuadroSyncRole {
             _ => Err(anyhow!("invalid QuadroSync role: {}", value)),
         }
     }
+
+    fn from_drm_config(value: u32) -> Self {
+        match value {
+            FRAMELOCK_DISPLAY_CONFIG_SERVER => QuadroSyncRole::Server,
+            FRAMELOCK_DISPLAY_CONFIG_CLIENT => QuadroSyncRole::Client,
+            _ => QuadroSyncRole::Disabled,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            QuadroSyncRole::Disabled => "disabled",
+            QuadroSyncRole::Server => "server",
+            QuadroSyncRole::Client => "client",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status queries
+// ---------------------------------------------------------------------------
+
+/// Query whether display sync is enabled on a connector.
+pub fn get_display_sync(fd: RawFd, connector_id: u32) -> anyhow::Result<bool> {
+    let mut params = DrmNvidiaFramelockGetDisplaySyncParams {
+        connector_id,
+        enabled: 0,
+    };
+    nvidia_drm_ioctl(
+        fd,
+        drm_iowr::<DrmNvidiaFramelockGetDisplaySyncParams>(DRM_NVIDIA_FRAMELOCK_GET_DISPLAY_SYNC),
+        &mut params,
+    )
+    .context("failed to get framelock display sync")?;
+    Ok(params.enabled != 0)
+}
+
+/// Query the current framelock role configured on a connector.
+pub fn get_display_config(fd: RawFd, connector_id: u32) -> anyhow::Result<QuadroSyncRole> {
+    let mut params = DrmNvidiaFramelockGetDisplayConfigParams {
+        connector_id,
+        config: 0,
+    };
+    nvidia_drm_ioctl(
+        fd,
+        drm_iowr::<DrmNvidiaFramelockGetDisplayConfigParams>(
+            DRM_NVIDIA_FRAMELOCK_GET_DISPLAY_CONFIG,
+        ),
+        &mut params,
+    )
+    .context("failed to get framelock display config")?;
+    Ok(QuadroSyncRole::from_drm_config(params.config))
+}
+
+/// Query whether the framelock board reports sync ready (locked to the sync
+/// signal, either its own as the server or the incoming one as a client).
+pub fn get_sync_ready(fd: RawFd, framelock_index: u32) -> anyhow::Result<bool> {
+    let mut params = DrmNvidiaFramelockGetAttributeParams {
+        framelock_index,
+        attribute: NV_KMS_FRAMELOCK_ATTRIBUTE_SYNC_READY,
+        value: 0,
+        __pad: 0,
+    };
+    nvidia_drm_ioctl(
+        fd,
+        drm_iowr::<DrmNvidiaFramelockGetAttributeParams>(DRM_NVIDIA_FRAMELOCK_GET_ATTRIBUTE),
+        &mut params,
+    )
+    .context("failed to get framelock sync ready")?;
+    Ok(params.value != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -204,10 +297,41 @@ impl DisplayAttribute for QuadroSyncRoleAttribute {
 // Cross-output: QuadroSyncTopologyAttribute
 // ---------------------------------------------------------------------------
 
-// NvKmsFrameLockAttribute enum values for SET_ATTRIBUTE ioctl
-const NV_KMS_FRAMELOCK_ATTRIBUTE_SYNC_DELAY: u32 = 0;
-const NV_KMS_FRAMELOCK_ATTRIBUTE_HOUSE_SYNC_MODE: u32 = 3;
-const NV_KMS_FRAMELOCK_ATTRIBUTE_POLARITY: u32 = 6;
+// NvKmsFrameLockAttribute enum values for the SET/GET_ATTRIBUTE ioctls.
+// These must match enum NvKmsFrameLockAttribute in nvkms-api-types.h, which
+// the drm_nvidia_framelock_*_attribute_params structs pass through verbatim.
+const NV_KMS_FRAMELOCK_ATTRIBUTE_POLARITY: u32 = 0;
+const NV_KMS_FRAMELOCK_ATTRIBUTE_SYNC_DELAY: u32 = 1;
+const NV_KMS_FRAMELOCK_ATTRIBUTE_HOUSE_SYNC_MODE: u32 = 2;
+const NV_KMS_FRAMELOCK_ATTRIBUTE_SYNC_READY: u32 = 4;
+
+/// Validate the local role counts for a sync-enable request.
+///
+/// Server-only and client-only topologies are valid: in a multi-system
+/// framelock chain the counterpart displays live on other machines connected
+/// via the RJ45 ports, which this machine cannot see. The operator is
+/// responsible for the chain having exactly one server overall. Locally we
+/// only require that at least one display has a role (there is nothing to
+/// sync otherwise) and that at most one display is the server.
+fn validate_role_counts(servers: u32, clients: u32, sync_enable: bool) -> anyhow::Result<()> {
+    if !sync_enable {
+        return Ok(());
+    }
+
+    if servers > 1 {
+        return Err(anyhow!(
+            "QuadroSync allows at most one server per system, found {}",
+            servers
+        ));
+    }
+    if servers + clients == 0 {
+        return Err(anyhow!(
+            "QuadroSync sync enable requires at least one display with a server or client role"
+        ));
+    }
+
+    Ok(())
+}
 
 /// Cross-output framelock board configuration.  Owns per-output role attributes.
 ///
@@ -255,19 +379,7 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
             }
         }
 
-        if self.sync_enable {
-            if servers != 1 {
-                return Err(anyhow!(
-                    "QuadroSync requires exactly one server, found {}",
-                    servers
-                ));
-            }
-            if clients == 0 {
-                return Err(anyhow!("QuadroSync requires at least one client"));
-            }
-        }
-
-        Ok(())
+        validate_role_counts(servers, clients, self.sync_enable)
     }
 
     fn apply(&self, device: &mut DcsDevice) -> anyhow::Result<()> {
@@ -275,10 +387,13 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
 
         let fd = device.drm_device.as_fd().as_raw_fd();
 
-        // Step 1: Disable sync before changing roles (best-effort)
-        {
+        // Step 1: Disable sync before changing roles (best-effort). NVKMS
+        // rejects role changes while sync is enabled. The connector_id must
+        // be a real connector for the DRM lookup to succeed, so issue the
+        // disable per role-bearing connector.
+        for (_crtc, role_attr) in &self.roles {
             let mut params = DrmNvidiaFramelockSetDisplaySyncParams {
-                connector_id: 0,
+                connector_id: role_attr.connector_id,
                 enable: 0,
             };
             let _ = nvidia_drm_ioctl(
@@ -292,6 +407,11 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
 
         // Step 2: Set per-output roles
         for (_crtc, role_attr) in &self.roles {
+            tracing::info!(
+                "RTX PRO Sync: configuring connector {} as framelock {}",
+                role_attr.connector_id,
+                role_attr.role.describe()
+            );
             let mut params = DrmNvidiaFramelockSetDisplayConfigParams {
                 connector_id: role_attr.connector_id,
                 config: role_attr.role.to_drm_config(),
@@ -355,27 +475,61 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
             .context("failed to set framelock house sync mode")?;
         }
 
-        // Step 4: Enable sync if requested
+        // Step 4: Enable sync if requested. Sync is enabled on every
+        // connector with a role, server and clients alike, matching the
+        // nvidia-settings model. On a client-only system (multi-system
+        // framelock chain) the server lives on another machine.
         if self.sync_enable {
-            let server_connector = self
+            let role_connectors: Vec<(u32, QuadroSyncRole)> = self
                 .roles
                 .iter()
-                .find(|(_, r)| r.role == QuadroSyncRole::Server)
-                .map(|(_, r)| r.connector_id)
-                .ok_or_else(|| anyhow!("no server connector for sync enable"))?;
+                .filter(|(_, r)| r.role != QuadroSyncRole::Disabled)
+                .map(|(_, r)| (r.connector_id, r.role))
+                .collect();
 
-            let mut params = DrmNvidiaFramelockSetDisplaySyncParams {
-                connector_id: server_connector,
-                enable: 1,
-            };
-            nvidia_drm_ioctl(
-                fd,
-                drm_iow::<DrmNvidiaFramelockSetDisplaySyncParams>(
-                    DRM_NVIDIA_FRAMELOCK_SET_DISPLAY_SYNC,
-                ),
-                &mut params,
-            )
-            .context("failed to enable framelock sync")?;
+            let has_server = role_connectors
+                .iter()
+                .any(|(_, role)| *role == QuadroSyncRole::Server);
+
+            tracing::info!(
+                "RTX PRO Sync: enabling sync on {} display(s), this system is a framelock {}",
+                role_connectors.len(),
+                if has_server {
+                    "server"
+                } else {
+                    "client, expecting sync signal from the chain"
+                }
+            );
+
+            for (connector_id, _role) in &role_connectors {
+                let mut params = DrmNvidiaFramelockSetDisplaySyncParams {
+                    connector_id: *connector_id,
+                    enable: 1,
+                };
+                nvidia_drm_ioctl(
+                    fd,
+                    drm_iow::<DrmNvidiaFramelockSetDisplaySyncParams>(
+                        DRM_NVIDIA_FRAMELOCK_SET_DISPLAY_SYNC,
+                    ),
+                    &mut params,
+                )
+                .context("failed to enable framelock sync")?;
+            }
+
+            // Log the initial engagement state. Locking can take a moment,
+            // especially for a client waiting on the incoming signal, so also
+            // arm a one-shot delayed re-check for the operator.
+            match get_sync_ready(fd, self.framelock_index) {
+                Ok(true) => tracing::info!("RTX PRO Sync: sync engaged"),
+                Ok(false) => {
+                    tracing::info!("RTX PRO Sync: sync not yet engaged, re-checking shortly")
+                }
+                Err(e) => tracing::warn!("RTX PRO Sync: sync ready query failed: {}", e),
+            }
+
+            spawn_engagement_check(fd, self.framelock_index);
+        } else {
+            tracing::info!("RTX PRO Sync: sync disabled");
         }
 
         tracing::info!(
@@ -385,5 +539,72 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
         );
 
         Ok(())
+    }
+}
+
+/// One-shot delayed re-check of framelock engagement, so the operator gets a
+/// definitive "engaged" or "not engaged" log line after the board has had
+/// time to lock. Runs on a detached thread with a dup'd fd so it does not
+/// touch any server state.
+fn spawn_engagement_check(fd: RawFd, framelock_index: u32) {
+    const ENGAGEMENT_CHECK_DELAY_SECS: u64 = 30;
+
+    let check_fd = unsafe { libc::dup(fd) };
+    if check_fd < 0 {
+        tracing::warn!("RTX PRO Sync: could not dup DRM fd for engagement check");
+        return;
+    }
+
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(ENGAGEMENT_CHECK_DELAY_SECS));
+        match get_sync_ready(check_fd, framelock_index) {
+            Ok(true) => tracing::info!("RTX PRO Sync: sync engaged and in use"),
+            Ok(false) => tracing::warn!(
+                "RTX PRO Sync: sync not engaged after {}s, check chain cabling and \
+                 that exactly one system in the chain is the framelock server",
+                ENGAGEMENT_CHECK_DELAY_SECS
+            ),
+            Err(e) => tracing::warn!("RTX PRO Sync: engagement check failed: {}", e),
+        }
+        unsafe { libc::close(check_fd) };
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_role_counts;
+
+    #[test]
+    fn sync_disabled_allows_anything() {
+        assert!(validate_role_counts(0, 0, false).is_ok());
+        assert!(validate_role_counts(2, 0, false).is_ok());
+    }
+
+    #[test]
+    fn server_and_client_ok() {
+        assert!(validate_role_counts(1, 1, true).is_ok());
+        assert!(validate_role_counts(1, 3, true).is_ok());
+    }
+
+    #[test]
+    fn server_only_ok_for_multi_system() {
+        assert!(validate_role_counts(1, 0, true).is_ok());
+    }
+
+    #[test]
+    fn client_only_ok_for_multi_system() {
+        assert!(validate_role_counts(0, 1, true).is_ok());
+        assert!(validate_role_counts(0, 2, true).is_ok());
+    }
+
+    #[test]
+    fn two_servers_rejected() {
+        assert!(validate_role_counts(2, 0, true).is_err());
+        assert!(validate_role_counts(2, 1, true).is_err());
+    }
+
+    #[test]
+    fn no_roles_rejected() {
+        assert!(validate_role_counts(0, 0, true).is_err());
     }
 }
