@@ -13,8 +13,7 @@ pub mod display_number;
 pub mod mode;
 pub mod quadro_sync;
 
-use drm::control::crtc;
-
+use crate::render::dcs_output::OutputHandle;
 use crate::render::dcs_output::DcsOutput;
 use crate::render::DcsDevice;
 
@@ -43,7 +42,10 @@ pub trait TopologyAttribute: Send + Sync {
     /// Human-readable name for logging/debugging.
     fn name(&self) -> &str;
     /// Per-output attributes owned by this topology attribute.
-    fn display_attributes(&self) -> &[(crtc::Handle, Box<dyn DisplayAttribute>)];
+    fn display_attributes(&self) -> &[(OutputHandle, Box<dyn DisplayAttribute>)];
+    /// Every output this topology attribute touches. Used by the commit path
+    /// to find the single device that owns them all.
+    fn output_handles(&self) -> Vec<OutputHandle>;
     /// Validate cross-output invariants (e.g., exactly one server).
     fn validate(&self, device: &DcsDevice) -> anyhow::Result<()>;
     /// Apply this attribute, including all owned child display attributes.
@@ -61,7 +63,7 @@ pub struct PendingCommit {
 
     /// Standalone per-output attributes not owned by any topology
     /// (e.g., mode change, display number).
-    pub display_attrs: Vec<(crtc::Handle, Box<dyn DisplayAttribute>)>,
+    pub display_attrs: Vec<(OutputHandle, Box<dyn DisplayAttribute>)>,
 }
 
 impl PendingCommit {

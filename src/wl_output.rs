@@ -3,11 +3,11 @@
 //! `wl_output` global creation for DCS.
 //!
 //! DCS creates one `wl_output` global per connected display.  Each global
-//! carries the output's `crtc::Handle` as resource user data so that the
+//! carries the output's `OutputHandle` as resource user data so that the
 //! `zwp_dcs_manager.get_output` handler can resolve it via
-//! `output.data::<crtc::Handle>().copied()`.
+//! `output.data::<OutputHandle>().copied()`.
 
-use drm::control::crtc;
+use crate::render::dcs_output::OutputHandle;
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New,
     protocol::wl_output::{self, Mode as WlOutputMode, Subpixel, Transform, WlOutput},
@@ -15,18 +15,18 @@ use smithay::reexports::wayland_server::{
 
 use crate::DcsState;
 
-impl GlobalDispatch<WlOutput, crtc::Handle> for DcsState {
+impl GlobalDispatch<WlOutput, OutputHandle> for DcsState {
     fn bind(
         state: &mut Self,
         _handle: &DisplayHandle,
         _client: &Client,
         resource: New<WlOutput>,
-        global_data: &crtc::Handle,
+        global_data: &OutputHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        let crtc = *global_data;
-        let output = data_init.init(resource, crtc);
-        if let Some(dcs_out) = state.output_for_crtc(crtc) {
+        let handle = *global_data;
+        let output = data_init.init(resource, handle);
+        if let Some(dcs_out) = state.output_for_handle(handle) {
             output.geometry(
                 0,
                 0,
@@ -49,13 +49,13 @@ impl GlobalDispatch<WlOutput, crtc::Handle> for DcsState {
     }
 }
 
-impl Dispatch<WlOutput, crtc::Handle> for DcsState {
+impl Dispatch<WlOutput, OutputHandle> for DcsState {
     fn request(
         _state: &mut Self,
         _client: &Client,
         _resource: &WlOutput,
         request: wl_output::Request,
-        _data: &crtc::Handle,
+        _data: &OutputHandle,
         _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {

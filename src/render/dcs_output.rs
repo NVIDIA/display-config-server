@@ -481,3 +481,47 @@ impl DcsOutput {
         Ok(())
     }
 }
+
+/// Identifies one display across all devices DCS manages.
+///
+/// `crtc::Handle` is a per-device DRM object id. Two GPUs can legitimately
+/// hand out the same numeric handle, so any lookup that spans devices must
+/// carry the owning device as well. `OutputHandle` is that pair. `DcsDevice`
+/// itself still keys its `outputs` map by the device-local `crtc::Handle`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OutputHandle {
+    /// Index into `DcsState::devices`.
+    pub device_index: usize,
+    /// CRTC driving the display, local to that device.
+    pub crtc: crtc::Handle,
+}
+
+impl OutputHandle {
+    pub fn new(device_index: usize, crtc: crtc::Handle) -> Self {
+        Self { device_index, crtc }
+    }
+}
+
+#[cfg(test)]
+mod output_handle_tests {
+    use super::*;
+    use std::num::NonZeroU32;
+
+    fn crtc(raw: u32) -> crtc::Handle {
+        crtc::Handle::from(NonZeroU32::new(raw).unwrap())
+    }
+
+    #[test]
+    fn same_crtc_on_different_devices_are_distinct_handles() {
+        let a = OutputHandle::new(0, crtc(42));
+        let b = OutputHandle::new(1, crtc(42));
+        assert_ne!(a, b);
+        let set: HashSet<OutputHandle> = [a, b].into_iter().collect();
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn identical_handles_are_equal() {
+        assert_eq!(OutputHandle::new(1, crtc(7)), OutputHandle::new(1, crtc(7)));
+    }
+}

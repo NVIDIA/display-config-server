@@ -59,6 +59,7 @@ mod wl_output;
 use std::sync::Arc;
 
 use render::DcsDevice;
+use render::dcs_output::OutputHandle;
 use protocols::zwp_display_config_server_v1::zwp_dcs_manager::ZwpDcsManager;
 use smithay::{
     backend::drm::{DrmEvent, DrmNode},
@@ -106,54 +107,52 @@ struct DcsState {
 }
 
 impl DcsState {
-    /// Find the [`DcsOutput`] whose compositor drives `crtc`, searching across
-    /// all devices.  Returns `None` when no output owns that CRTC.
-    fn output_for_crtc(&self, crtc: drm::control::crtc::Handle) -> Option<&render::dcs_output::DcsOutput> {
-        self.devices.iter().find_map(|d| d.outputs.get(&crtc))
+    /// Resolve an [`OutputHandle`] to its `DcsOutput`. Indexes the owning device
+    /// directly; never scans other devices, so colliding per-device CRTC
+    /// handles cannot resolve to the wrong GPU.
+    fn output_for_handle(&self, handle: OutputHandle) -> Option<&render::dcs_output::DcsOutput> {
+        self.devices.get(handle.device_index)?.outputs.get(&handle.crtc)
     }
 
-    /// Mutable variant of [`output_for_crtc`].
-    fn output_for_crtc_mut(&mut self, crtc: drm::control::crtc::Handle) -> Option<&mut render::dcs_output::DcsOutput> {
-        self.devices.iter_mut().find_map(|d| d.outputs.get_mut(&crtc))
+    /// Mutable variant of [`output_for_handle`].
+    fn output_for_handle_mut(&mut self, handle: OutputHandle) -> Option<&mut render::dcs_output::DcsOutput> {
+        self.devices.get_mut(handle.device_index)?.outputs.get_mut(&handle.crtc)
     }
 
-    /// Find the [`DcsDevice`] that owns the output driving `crtc`.
-    fn device_for_crtc(&self, crtc: drm::control::crtc::Handle) -> Option<&render::DcsDevice> {
-        self.devices.iter().find(|d| d.outputs.contains_key(&crtc))
+    /// The device owning `handle`, if the handle resolves to a known output.
+    fn device_for_handle(&self, handle: OutputHandle) -> Option<&render::DcsDevice> {
+        let device = self.devices.get(handle.device_index)?;
+        device.outputs.contains_key(&handle.crtc).then_some(device)
     }
 
-    /// Test whether the requested mode is accepted by the hardware without
-    /// applying it, delegating to the owning [`DcsDevice`].
+    /// Validate a mode change on the output identified by `handle`.
     fn validate_output_mode_change(
         &self,
-        crtc: drm::control::crtc::Handle,
+        handle: OutputHandle,
         width: u32,
         height: u32,
         refresh_mhz: u32,
     ) -> anyhow::Result<()> {
-        for device in &self.devices {
-            if device.outputs.contains_key(&crtc) {
-                return device.validate_output_mode_change(crtc, width, height, refresh_mhz);
-            }
-        }
-        anyhow::bail!("no device found for CRTC {:?}", crtc)
+        let device = self
+            .device_for_handle(handle)
+            .ok_or_else(|| anyhow::anyhow!("no device found for output {:?}", handle))?;
+        device.validate_output_mode_change(handle.crtc, width, height, refresh_mhz)
     }
 
-    /// Apply the requested mode to the output driving `crtc`, delegating to
-    /// the owning [`DcsDevice`].
+    /// Commit a mode change on the output identified by `handle`.
     fn commit_output_mode_change(
         &mut self,
-        crtc: drm::control::crtc::Handle,
+        handle: OutputHandle,
         width: u32,
         height: u32,
         refresh_mhz: u32,
     ) -> anyhow::Result<()> {
-        for device in &mut self.devices {
-            if device.outputs.contains_key(&crtc) {
-                return device.commit_output_mode_change(crtc, width, height, refresh_mhz);
-            }
-        }
-        anyhow::bail!("no device found for CRTC {:?}", crtc)
+        let device = self
+            .devices
+            .get_mut(handle.device_index)
+            .filter(|d| d.outputs.contains_key(&handle.crtc))
+            .ok_or_else(|| anyhow::anyhow!("no device found for output {:?}", handle))?;
+        device.commit_output_mode_change(handle.crtc, width, height, refresh_mhz)
     }
 }
 
@@ -168,14 +167,17 @@ impl DrmLeaseHandler for DcsState {
 
     fn lease_request(
         &mut self,
-        _node: DrmNode,
+        node: DrmNode,
         request: DrmLeaseRequest,
     ) -> Result<DrmLeaseBuilder, LeaseRejected> {
-        // Find the device that owns the requested connectors.
+        // The lease request arrives on a specific wp_drm_lease_device_v1
+        // global, i.e. a specific GPU. Resolve connectors within that device
+        // only; connector handles are not unique across GPUs.
         let device = self
             .devices
             .iter()
-            .find(|d| {
+            .find(|d| d.drm_node == node)
+            .filter(|d| {
                 request.connectors.iter().all(|c| {
                     d.outputs.values().any(|o| o.connector_handle == *c)
                 })
@@ -201,24 +203,24 @@ impl DrmLeaseHandler for DcsState {
         Ok(builder)
     }
 
-    fn new_active_lease(&mut self, _node: DrmNode, lease: DrmLease) {
+    fn new_active_lease(&mut self, node: DrmNode, lease: DrmLease) {
         info!("DRM lease {} granted", lease.id());
         // Move the lease into the matching output. DrmLease::Drop revokes the
         // kernel lease, so we must move (not clone) it into persistent storage.
         let mut lease = Some(lease);
-        'outer: for device in &mut self.devices {
+        if let Some(device) = self.devices.iter_mut().find(|d| d.drm_node == node) {
             for output in device.outputs.values_mut() {
                 if lease.as_ref().map_or(false, |l| l.connectors().any(|c| *c == output.connector_handle)) {
                     output.active_lease = lease.take();
-                    break 'outer;
+                    break;
                 }
             }
         }
     }
 
-    fn lease_destroyed(&mut self, _node: DrmNode, lease_id: u32) {
+    fn lease_destroyed(&mut self, node: DrmNode, lease_id: u32) {
         info!("DRM lease {} destroyed", lease_id);
-        for device in &mut self.devices {
+        if let Some(device) = self.devices.iter_mut().find(|d| d.drm_node == node) {
             for output in device.outputs.values_mut() {
                 if output.active_lease.as_ref().map_or(false, |l| l.id() == lease_id) {
                     output.active_lease = None;
@@ -240,45 +242,65 @@ struct DcsCalloopData {
     display: Display<DcsState>,
 }
 
-/// Resolve the DRM device path from command-line arguments.
+/// Which DRM cards DCS should open.
+#[derive(Debug)]
+enum CardSelection {
+    /// Open every `/dev/dri/card*` device.
+    All,
+    /// Open exactly this device path.
+    Path(String),
+}
+
+/// Parse the command line (without argv[0]).
 ///
 /// Supported forms:
-///   --card <N>          →  /dev/dri/cardN
-///   /dev/dri/cardN      →  used as-is (positional argument)
-///
-/// When no argument is given, tries `/dev/dri/card0` first, then falls back
-/// to `/dev/dri/card1` if `card0` does not exist.
-fn parse_drm_path() -> Result<String, Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1).peekable();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--card" => {
-                let n = args
-                    .next()
-                    .ok_or("--card requires a card number argument")?;
-                // Validate that it's a non-negative integer.
-                n.parse::<u32>()
-                    .map_err(|_| format!("--card: '{}' is not a valid card number", n))?;
-                return Ok(format!("/dev/dri/card{}", n));
-            }
-            path if !path.starts_with('-') => {
-                return Ok(path.to_string());
-            }
-            unknown => {
-                return Err(format!("unknown argument: {}", unknown).into());
-            }
+///   (nothing)           →  All /dev/dri/card* devices
+///   --card <N>          →  /dev/dri/cardN only
+///   /dev/dri/cardN      →  that path only (positional)
+fn parse_card_selection(args: &[String]) -> Result<CardSelection, String> {
+    let mut iter = args.iter();
+    let Some(arg) = iter.next() else {
+        return Ok(CardSelection::All);
+    };
+    match arg.as_str() {
+        "--card" => {
+            let n = iter
+                .next()
+                .ok_or_else(|| "--card requires a card number argument".to_string())?;
+            n.parse::<u32>()
+                .map_err(|_| format!("--card: '{}' is not a valid card number", n))?;
+            Ok(CardSelection::Path(format!("/dev/dri/card{}", n)))
         }
+        path if !path.starts_with('-') => Ok(CardSelection::Path(path.to_string())),
+        unknown => Err(format!("unknown argument: {}", unknown)),
     }
+}
 
-    // No explicit device given: prefer card0, fall back to card1.
-    let default = "/dev/dri/card0";
-    let fallback = "/dev/dri/card1";
-    if std::path::Path::new(default).exists() {
-        Ok(default.to_string())
-    } else {
-        info!("{} not found, falling back to {}", default, fallback);
-        Ok(fallback.to_string())
+/// Every `/dev/dri/card*` primary node, sorted by card number so device
+/// indices are stable across runs. Render nodes (`renderD*`) are excluded.
+fn drm_card_paths() -> Vec<String> {
+    let entries = match std::fs::read_dir("/dev/dri") {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!("cannot read /dev/dri: {}", e);
+            return Vec::new();
+        }
+    };
+    let mut cards: Vec<(u32, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(number_str) = name.strip_prefix("card") else {
+            continue;
+        };
+        let Ok(number) = number_str.parse::<u32>() else {
+            continue;
+        };
+        cards.push((number, format!("/dev/dri/{}", name)));
     }
+    cards.sort_unstable_by_key(|(number, _)| *number);
+    cards.into_iter().map(|(_, path)| path).collect()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -286,16 +308,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     // Parse --card <N> to select /dev/dri/cardN, or accept a full device path
-    // as a positional argument.  Defaults to card0.
-    let drm_path = parse_drm_path()?;
+    // as a positional argument. Defaults to opening every DRM card.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    let selection = parse_card_selection(&cli_args)?;
+    let explicit = matches!(selection, CardSelection::Path(_));
+    let paths: Vec<String> = match selection {
+        CardSelection::Path(path) => vec![path],
+        CardSelection::All => {
+            let found = drm_card_paths();
+            if found.is_empty() {
+                return Err("no DRM devices found under /dev/dri".into());
+            }
+            found
+        }
+    };
 
-    info!("Initialising DRM device: {}", drm_path);
-
-    // Open the device, create the shared renderer, and enumerate all
-    // connected outputs. The initial splash frame is rendered below before
-    // the event loop starts.
-    let (mut device, drm_notifier) = DcsDevice::new(&drm_path)?;
-    device.render().expect("initial render failed");
+    // Open every selected card. With an explicit selection a failure is fatal;
+    // when auto-enumerating, a GPU with no connected displays is skipped.
+    let mut devices: Vec<DcsDevice> = Vec::new();
+    let mut notifiers = Vec::new();
+    let mut next_display_number: i32 = 1;
+    for path in &paths {
+        info!("Initialising DRM device: {}", path);
+        match DcsDevice::new(path, next_display_number) {
+            Ok((mut device, notifier)) => {
+                device.render().expect("initial render failed");
+                next_display_number += device.outputs.len() as i32;
+                devices.push(device);
+                notifiers.push(notifier);
+            }
+            Err(e) if explicit => return Err(e.into()),
+            Err(e) => tracing::warn!("Skipping {}: {:#}", path, e),
+        }
+    }
+    if devices.is_empty() {
+        return Err("no usable DRM display devices found".into());
+    }
 
     // -------------------------------------------------------------------------
     // Event loop
@@ -306,17 +354,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // VBlank events carry the CRTC handle so we can dispatch directly to the
     // output that flipped, leaving other outputs untouched.
-    let device_idx = 0usize;
-    loop_handle.insert_source(drm_notifier, move |event, _metadata, data| match event {
-        DrmEvent::VBlank(crtc) => {
-            data.state.devices[device_idx]
-                .frame_submitted(crtc)
-                .expect("frame_submitted failed");
-        }
-        DrmEvent::Error(err) => {
-            tracing::error!("DRM error: {}", err);
-        }
-    })?;
+    //
+    // One VBlank source per device, each dispatching to its own device so a
+    // flip on GPU 1 never touches GPU 0's outputs.
+    for (device_index, drm_notifier) in notifiers.into_iter().enumerate() {
+        loop_handle.insert_source(drm_notifier, move |event, _metadata, data| match event {
+            DrmEvent::VBlank(crtc) => {
+                data.state.devices[device_index]
+                    .frame_submitted(crtc)
+                    .expect("frame_submitted failed");
+            }
+            DrmEvent::Error(err) => {
+                tracing::error!("DRM error on device {}: {}", device_index, err);
+            }
+        })?;
+    }
 
     // -------------------------------------------------------------------------
     // Wayland display
@@ -347,7 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .create_global::<DcsState, ZwpDcsManager, _>(1, ());
 
     // Advertise the QuadroSync sub-protocol only when hardware is detected.
-    if device.quadro_sync_state.is_some() {
+    if devices.iter().any(|d| d.quadro_sync_state.is_some()) {
         use crate::protocols::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_manager::ZwpDcsQuadroSyncManager;
         display
             .handle()
@@ -357,13 +409,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Advertise wp_drm_lease_device_v1 so Vulkan D2D clients can lease the
     // displays that DCS has configured.
-    {
-        let mut drm_lease_state = DrmLeaseState::new::<DcsState>(
-            &display.handle(),
-            &device.drm_node,
-        )?;
-
-        // Make every connected output available for leasing.
+    //
+    // One wp_drm_lease_device_v1 global per GPU, each advertising only that
+    // GPU's connectors.
+    for device in &mut devices {
+        let mut drm_lease_state = DrmLeaseState::new::<DcsState>(&display.handle(), &device.drm_node)?;
         for output in device.outputs.values() {
             let name = format!("DCS-{}", output.display_number);
             let desc = format!(
@@ -372,18 +422,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             drm_lease_state.add_connector::<DcsState>(output.connector_handle, name, desc);
         }
-
         device.drm_lease_state = Some(drm_lease_state);
     }
 
-    // Advertise one wl_output global per connected display so that
+    // Advertise one wl_output global per display across all devices, so that
     // dcs-client clients can call zwp_dcs_manager.get_output().
-    // The crtc::Handle is stored as global data and resolved by the
-    // get_output handler via output.data::<crtc::Handle>().
+    // The output's OutputHandle is stored as global data and resolved by the
+    // get_output handler via output.data::<OutputHandle>().
     {
         use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
-        for &crtc in device.outputs.keys() {
-            display.handle().create_global::<DcsState, WlOutput, _>(4, crtc);
+        for (device_index, device) in devices.iter().enumerate() {
+            for &crtc in device.outputs.keys() {
+                let handle = OutputHandle::new(device_index, crtc);
+                display.handle().create_global::<DcsState, WlOutput, _>(4, handle);
+            }
         }
     }
 
@@ -407,7 +459,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------------
 
     let mut calloop_data = DcsCalloopData {
-        state: DcsState { devices: vec![device], pending_commit: None },
+        state: DcsState { devices, pending_commit: None },
         display,
     };
 
@@ -430,4 +482,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_args_selects_all_cards() {
+        assert!(matches!(parse_card_selection(&args(&[])).unwrap(), CardSelection::All));
+    }
+
+    #[test]
+    fn card_flag_selects_one_path() {
+        match parse_card_selection(&args(&["--card", "1"])).unwrap() {
+            CardSelection::Path(p) => assert_eq!(p, "/dev/dri/card1"),
+            other => panic!("expected Path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn positional_path_selects_that_path() {
+        match parse_card_selection(&args(&["/dev/dri/card3"])).unwrap() {
+            CardSelection::Path(p) => assert_eq!(p, "/dev/dri/card3"),
+            other => panic!("expected Path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn card_flag_requires_value() {
+        assert!(parse_card_selection(&args(&["--card"])).is_err());
+    }
+
+    #[test]
+    fn card_flag_rejects_non_numeric() {
+        assert!(parse_card_selection(&args(&["--card", "zero"])).is_err());
+    }
+
+    #[test]
+    fn unknown_flag_rejected() {
+        assert!(parse_card_selection(&args(&["--bogus"])).is_err());
+    }
 }

@@ -4,8 +4,9 @@
 
 use std::sync::Mutex;
 
-use drm::control::crtc;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
+
+use crate::render::dcs_output::OutputHandle;
 
 use crate::attribute::quadro_sync::{
     HouseSyncMode, QuadroSyncPolarity, QuadroSyncRole, QuadroSyncRoleAttribute,
@@ -32,14 +33,14 @@ use crate::DcsState;
 
 /// User data for a `zwp_dcs_quadro_sync_output` resource.
 pub struct WlQuadroSyncOutput {
-    /// CRTC of the base DCS output this extends.
-    pub crtc: Option<crtc::Handle>,
+    /// Output of the base DCS output this extends.
+    pub handle: Option<OutputHandle>,
 }
 
 /// User data for a `zwp_dcs_quadro_sync_display_configuration` resource.
 pub struct WlQuadroSyncDisplayConfiguration {
     /// Inherited from the base DCS output.
-    pub crtc: Option<crtc::Handle>,
+    pub handle: Option<OutputHandle>,
     /// Raw DRM connector id, resolved from the base DCS output at bind time.
     pub connector_id: Option<u32>,
     /// Role staged by `set_role`.
@@ -83,17 +84,17 @@ impl Dispatch<ZwpDcsQuadroSyncManager, ()> for DcsState {
     ) {
         match request {
             zwp_dcs_quadro_sync_manager::Request::GetOutput { id, output } => {
-                // Look up the CRTC from the base DCS output's user data.
-                let crtc = output.data::<WlDcsOutput>().and_then(|d| d.crtc);
+                // Look up the OutputHandle from the base DCS output's user data.
+                let handle = output.data::<WlDcsOutput>().and_then(|d| d.handle);
 
-                let resource = data_init.init(id, WlQuadroSyncOutput { crtc });
+                let resource = data_init.init(id, WlQuadroSyncOutput { handle });
 
                 // Send the current QuadroSync state for this output, queried
                 // from the hardware.
-                if let Some(crtc_handle) = crtc {
-                    if let Some(dcs_output) = state.output_for_crtc(crtc_handle) {
+                if let Some(handle) = handle {
+                    if let Some(dcs_output) = state.output_for_handle(handle) {
                         let connector_id: u32 = dcs_output.connector_handle.into();
-                        let (role, engaged) = query_output_state(state, crtc_handle, connector_id);
+                        let (role, engaged) = query_output_state(state, handle, connector_id);
 
                         resource.sync_status(engaged as u32);
                         resource.role(role);
@@ -131,14 +132,14 @@ impl Dispatch<ZwpDcsQuadroSyncManager, ()> for DcsState {
 /// debug log rather than erroring the protocol request.
 fn query_output_state(
     state: &DcsState,
-    crtc: crtc::Handle,
+    handle: OutputHandle,
     connector_id: u32,
 ) -> (OutputRole, bool) {
     use std::os::unix::io::{AsFd, AsRawFd};
 
     use crate::attribute::quadro_sync::{get_display_config, get_display_sync, get_sync_ready};
 
-    let Some(device) = state.device_for_crtc(crtc) else {
+    let Some(device) = state.device_for_handle(handle) else {
         return (OutputRole::Disabled, false);
     };
     let fd = device.drm_device.as_fd().as_raw_fd();
@@ -191,14 +192,14 @@ impl Dispatch<ZwpDcsQuadroSyncOutput, WlQuadroSyncOutput> for DcsState {
     ) {
         match request {
             zwp_dcs_quadro_sync_output::Request::GetConfiguration { id, config } => {
-                let crtc = data.crtc;
+                let handle = data.handle;
 
-                // connector_id is resolved during commit via the CRTC handle;
+                // connector_id is resolved during commit via the output handle;
                 // nothing to look up here without DcsState access.
                 let qs_config = data_init.init(
                     id,
                     Mutex::new(WlQuadroSyncDisplayConfiguration {
-                        crtc,
+                        handle,
                         connector_id: None,
                         pending_role: None,
                     }),
@@ -341,7 +342,7 @@ impl DcsState {
                 .lock()
                 .unwrap();
 
-            let Some(crtc) = qs_config.crtc else {
+            let Some(handle) = qs_config.handle else {
                 continue;
             };
 
@@ -349,16 +350,16 @@ impl DcsState {
                 .pending_role
                 .unwrap_or(QuadroSyncRole::Disabled);
 
-            // Resolve the connector_id from the DcsOutput for this CRTC.
+            // Resolve the connector_id from the DcsOutput for this handle.
             let connector_id = self
-                .output_for_crtc(crtc)
+                .output_for_handle(handle)
                 .map(|o| {
                     let raw: u32 = o.connector_handle.into();
                     raw
                 })
                 .unwrap_or(0);
 
-            roles.push((crtc, QuadroSyncRoleAttribute { connector_id, role }));
+            roles.push((handle, QuadroSyncRoleAttribute { connector_id, role }));
         }
 
         let attr = QuadroSyncTopologyAttribute {

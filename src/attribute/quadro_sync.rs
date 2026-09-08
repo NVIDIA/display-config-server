@@ -5,8 +5,8 @@
 use std::os::unix::io::RawFd;
 
 use anyhow::{anyhow, Context};
-use drm::control::crtc;
 
+use crate::render::dcs_output::OutputHandle;
 use crate::render::dcs_output::DcsOutput;
 use crate::render::DcsDevice;
 use super::{DisplayAttribute, TopologyAttribute};
@@ -339,8 +339,8 @@ fn validate_role_counts(servers: u32, clients: u32, sync_enable: bool) -> anyhow
 /// access `connector_id` and `role` without downcasting.  `display_attributes()`
 /// returns an empty slice; the parent applies its children itself.
 pub struct QuadroSyncTopologyAttribute {
-    /// Per-output role assignments (crtc, role).
-    pub roles: Vec<(crtc::Handle, QuadroSyncRoleAttribute)>,
+    /// Per-output role assignments (output handle, role).
+    pub roles: Vec<(OutputHandle, QuadroSyncRoleAttribute)>,
     /// Board-level settings.
     pub sync_delay: Option<u32>,
     pub polarity: Option<QuadroSyncPolarity>,
@@ -355,21 +355,25 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
         "quadro_sync"
     }
 
-    fn display_attributes(&self) -> &[(crtc::Handle, Box<dyn DisplayAttribute>)] {
+    fn display_attributes(&self) -> &[(OutputHandle, Box<dyn DisplayAttribute>)] {
         // Roles are stored as concrete types and applied in apply(); nothing to
         // return here as standalone DisplayAttributes.
         &[]
+    }
+
+    fn output_handles(&self) -> Vec<OutputHandle> {
+        self.roles.iter().map(|(handle, _)| *handle).collect()
     }
 
     fn validate(&self, device: &DcsDevice) -> anyhow::Result<()> {
         let mut servers = 0u32;
         let mut clients = 0u32;
 
-        for (crtc, role_attr) in &self.roles {
-            if !device.outputs.contains_key(crtc) {
+        for (handle, role_attr) in &self.roles {
+            if !device.outputs.contains_key(&handle.crtc) {
                 return Err(anyhow!(
                     "QuadroSync role references unknown CRTC {:?}",
-                    crtc
+                    handle.crtc
                 ));
             }
             match role_attr.role {
@@ -391,7 +395,7 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
         // rejects role changes while sync is enabled. The connector_id must
         // be a real connector for the DRM lookup to succeed, so issue the
         // disable per role-bearing connector.
-        for (_crtc, role_attr) in &self.roles {
+        for (_handle, role_attr) in &self.roles {
             let mut params = DrmNvidiaFramelockSetDisplaySyncParams {
                 connector_id: role_attr.connector_id,
                 enable: 0,
@@ -406,7 +410,7 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
         }
 
         // Step 2: Set per-output roles
-        for (_crtc, role_attr) in &self.roles {
+        for (_handle, role_attr) in &self.roles {
             tracing::info!(
                 "RTX PRO Sync: configuring connector {} as framelock {}",
                 role_attr.connector_id,

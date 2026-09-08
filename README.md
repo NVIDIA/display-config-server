@@ -109,16 +109,13 @@ relevant development headers are installed for your distribution.
 
 ## Running
 
-```sh
-# Auto-detect the first available DRM device (card0, then card1)
-display-config-server
-
-# Explicitly select a card by index
-display-config-server --card 1
-
-# Or pass a full device path
-display-config-server /dev/dri/card0
 ```
+display-config-server [--card N | /dev/dri/cardN]
+```
+
+With no arguments, DCS opens every DRM card under /dev/dri and manages
+all of their connected displays. Pass --card N (or a device path) to restrict
+DCS to a single GPU.
 
 Log output is controlled by the `RUST_LOG` environment variable (e.g.
 `RUST_LOG=debug`).

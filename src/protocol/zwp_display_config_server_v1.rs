@@ -30,8 +30,9 @@
 use std::sync::Mutex;
 
 use anyhow::anyhow;
-use drm::control::crtc;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
+
+use crate::render::dcs_output::OutputHandle;
 
 use crate::protocols::zwp_display_config_server_v1::{
     zwp_dcs_display_configuration::{self, Error as ConfigError, ZwpDcsDisplayConfiguration},
@@ -51,30 +52,28 @@ use crate::DcsState;
 
 /// Per-resource state for a `zwp_dcs_output` protocol object.
 ///
-/// Stores the `crtc::Handle` that links this protocol object back to the
+/// Stores the `OutputHandle` that links this protocol object back to the
 /// corresponding [`crate::render::DcsOutput`] inside `DcsState::devices`.
 /// `None` when the `wl_output` passed to `get_output` could not be resolved
-/// to a known DCS CRTC (e.g. because the `wl_output` global is not yet
+/// to a known DCS output (e.g. because the `wl_output` global is not yet
 /// implemented).
 pub struct WlDcsOutput {
-    /// CRTC this output maps to in `DcsDevice::outputs`. `None` if the
+    /// Identifies the backing `DcsOutput` across all devices. `None` if the
     /// `wl_output` could not be resolved to a known DCS output.
-    /// Used by topology commits to locate the backing `DcsOutput`.
-    pub crtc: Option<crtc::Handle>,
+    pub handle: Option<OutputHandle>,
 }
 
 /// Per-resource state for a `zwp_dcs_display_configuration` protocol object.
 ///
-/// Carries the CRTC inherited from the [`WlDcsOutput`] it was created from,
+/// Carries the OutputHandle inherited from the [`WlDcsOutput`] it was created from,
 /// plus any pending changes staged by `set_mode` / `set_number` requests.
 /// The whole struct is wrapped in a [`Mutex`] as the user-data type, because
 /// `Dispatch::request` receives `&UserData` (not `&mut`) and wayland-server
 /// requires `UserData: Send + Sync`.
 pub struct WlDcsDisplayConfiguration {
-    /// CRTC inherited from the `WlDcsOutput` this configuration was created
-    /// from. Identifies which display the pending changes apply to during `commit`.
-    #[allow(dead_code)]
-    pub crtc: Option<crtc::Handle>,
+    /// Output inherited from the `WlDcsOutput` this configuration was created
+    /// from. Identifies which display the pending changes apply to on `commit`.
+    pub handle: Option<OutputHandle>,
     /// Pending mode (width px, height px, refresh mHz) from `set_mode`.
     /// `None` means the mode is not being changed in this commit.
     pub pending_mode: Option<(u32, u32, u32)>,
@@ -126,18 +125,18 @@ impl Dispatch<ZwpDcsManager, ()> for DcsState {
     ) {
         match request {
             zwp_dcs_manager::Request::GetOutput { id, output } => {
-                // Resolve the wl_output to a CRTC handle via its resource user data.
+                // Resolve the wl_output to an OutputHandle via its resource user data.
                 // Returns None when wl_output globals are not yet implemented.
-                let crtc = output.data::<crtc::Handle>().copied();
-                if crtc.is_none() {
-                    tracing::warn!("get_output: wl_output has no associated DCS CRTC");
+                let handle = output.data::<OutputHandle>().copied();
+                if handle.is_none() {
+                    tracing::warn!("get_output: wl_output has no associated DCS output");
                 }
 
-                let resource = data_init.init(id, WlDcsOutput { crtc });
+                let resource = data_init.init(id, WlDcsOutput { handle });
 
                 // Send the initial burst of events describing this output.
-                if let Some(crtc) = crtc {
-                    if let Some(dcs_out) = state.output_for_crtc(crtc) {
+                if let Some(handle) = handle {
+                    if let Some(dcs_out) = state.output_for_handle(handle) {
                         // Send one mode event per unique (width, height, refresh)
                         // combination.  DRM connector mode lists can contain
                         // duplicate entries (e.g. the same mode appearing in both
@@ -203,7 +202,7 @@ impl Dispatch<ZwpDcsOutput, WlDcsOutput> for DcsState {
                 data_init.init(
                     id,
                     Mutex::new(WlDcsDisplayConfiguration {
-                        crtc: data.crtc,
+                        handle: data.handle,
                         pending_mode: None,
                         pending_number: None,
                         quadro_sync_config: None,
@@ -263,14 +262,15 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
                 let mut topology = data.lock().unwrap();
 
                 // Reject the configuration if its output is already represented
-                // in this topology. Comparing by CRTC handle is sufficient
-                // because each connected display maps to exactly one CRTC.
-                let new_crtc = config
+                // in this topology. Comparing by OutputHandle is sufficient
+                // because each connected display maps to exactly one
+                // (device, CRTC) pair.
+                let new_handle = config
                     .data::<Mutex<WlDcsDisplayConfiguration>>()
                     .expect("wrong user data type on zwp_dcs_display_configuration")
                     .lock()
                     .unwrap()
-                    .crtc;
+                    .handle;
 
                 let duplicate = topology.configurations.iter().any(|existing| {
                     existing
@@ -278,8 +278,8 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
                         .expect("wrong user data type on zwp_dcs_display_configuration")
                         .lock()
                         .unwrap()
-                        .crtc
-                        == new_crtc
+                        .handle
+                        == new_handle
                 });
 
                 if duplicate {
@@ -358,12 +358,12 @@ impl DcsState {
                 .lock()
                 .unwrap();
 
-            let Some(crtc) = config.crtc else {
-                return Err((idx, anyhow!("configuration has no associated CRTC")));
+            let Some(handle) = config.handle else {
+                return Err((idx, anyhow!("configuration has no associated output")));
             };
 
             if let Some((w, h, r)) = config.pending_mode {
-                commit.display_attrs.push((crtc, Box::new(ModeAttribute {
+                commit.display_attrs.push((handle, Box::new(ModeAttribute {
                     width: w,
                     height: h,
                     refresh_mhz: r,
@@ -371,42 +371,92 @@ impl DcsState {
             }
 
             if let Some(number) = config.pending_number {
-                commit.display_attrs.push((crtc, Box::new(DisplayNumberAttribute {
+                commit.display_attrs.push((handle, Box::new(DisplayNumberAttribute {
                     number,
                 })));
             }
         }
 
-        // Phase 1: Validate topology attrs (cross-output invariants).
+        // Phase 1: Validate topology attrs against the single device that owns
+        // all of their outputs. A topology spanning two GPUs is rejected here;
+        // cross-device framelock is a follow-on feature.
+        let mut topo_targets: Vec<usize> = Vec::with_capacity(commit.topology_attrs.len());
         for topo_attr in &commit.topology_attrs {
-            for device in &self.devices {
-                topo_attr.validate(device).map_err(|e| (0, e))?;
-            }
+            let device_index = owning_device_index(&topo_attr.output_handles())
+                .map_err(|e| (0, e.context(format!("{} topology", topo_attr.name()))))?;
+            let device = self
+                .devices
+                .get(device_index)
+                .ok_or_else(|| (0, anyhow!("no device at index {}", device_index)))?;
+            topo_attr.validate(device).map_err(|e| (0, e))?;
+            topo_targets.push(device_index);
         }
 
         // Phase 2: Validate standalone display attrs.
-        for (idx, (crtc, attr)) in commit.display_attrs.iter().enumerate() {
-            if let Some(output) = self.output_for_crtc(*crtc) {
+        for (idx, (handle, attr)) in commit.display_attrs.iter().enumerate() {
+            if let Some(output) = self.output_for_handle(*handle) {
                 attr.validate(output).map_err(|e| (idx, e))?;
             } else {
-                return Err((idx, anyhow!("no output found for CRTC {:?}", crtc)));
+                return Err((idx, anyhow!("no output found for {:?}", handle)));
             }
         }
 
-        // Phase 3: Apply topology attrs (each applies its children internally).
-        for topo_attr in &commit.topology_attrs {
-            for device in &mut self.devices {
-                topo_attr.apply(device).map_err(|e| (0, e))?;
-            }
+        // Phase 3: Apply topology attrs to their owning device.
+        for (topo_attr, &device_index) in commit.topology_attrs.iter().zip(&topo_targets) {
+            let device = &mut self.devices[device_index];
+            topo_attr.apply(device).map_err(|e| (0, e))?;
         }
 
         // Phase 4: Apply standalone display attrs.
-        for (idx, (crtc, attr)) in commit.display_attrs.iter().enumerate() {
-            if let Some(output) = self.output_for_crtc_mut(*crtc) {
+        for (idx, (handle, attr)) in commit.display_attrs.iter().enumerate() {
+            if let Some(output) = self.output_for_handle_mut(*handle) {
                 attr.apply(output).map_err(|e| (idx, e))?;
             }
         }
 
         Ok(())
+    }
+}
+
+/// The single device that owns every handle, or an error when the handles are empty
+/// or span more than one device.
+fn owning_device_index(handles: &[OutputHandle]) -> anyhow::Result<usize> {
+    let mut indices: Vec<usize> = handles.iter().map(|k| k.device_index).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    match indices.as_slice() {
+        [] => Err(anyhow!("topology attribute references no outputs")),
+        [one] => Ok(*one),
+        many => Err(anyhow!(
+            "topology spans {} GPUs (device indices {:?}); cross-GPU framelock is not supported yet",
+            many.len(),
+            many
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU32;
+
+    fn handle(device_index: usize, raw_crtc: u32) -> OutputHandle {
+        OutputHandle::new(device_index, drm::control::crtc::Handle::from(NonZeroU32::new(raw_crtc).unwrap()))
+    }
+
+    #[test]
+    fn owning_device_single_device() {
+        assert_eq!(owning_device_index(&[handle(1, 5), handle(1, 6)]).unwrap(), 1);
+    }
+
+    #[test]
+    fn owning_device_rejects_empty() {
+        assert!(owning_device_index(&[]).is_err());
+    }
+
+    #[test]
+    fn owning_device_rejects_span() {
+        let err = owning_device_index(&[handle(0, 5), handle(1, 5)]).unwrap_err();
+        assert!(err.to_string().contains("spans 2 GPUs"), "{}", err);
     }
 }

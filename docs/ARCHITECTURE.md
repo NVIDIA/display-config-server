@@ -27,41 +27,41 @@ XML with `wayland-scanner` (`generate_server_code!` / `generate_client_code!`).
 
 ### Top-level state (`src/main.rs`)
 
-- **`DcsState`** (`src/main.rs:101`) — the root compositor state passed to
+- **`DcsState`** (`src/main.rs`) — the root compositor state passed to
   every Wayland dispatch handler.
   - `devices: Vec<DcsDevice>` — one per DRM device (GPU) DCS manages.
   - `pending_commit: Option<attribute::PendingCommit>` — staging area for an
     in-progress topology commit (see the attribute system below).
-  - Helpers: `output_for_crtc`/`output_for_crtc_mut` (`:111`/`:116`) map a
-    CRTC handle to its `DcsOutput`; `validate_output_mode_change` (`:122`)
-    and `commit_output_mode_change` (`:139`) forward to the owning device.
-- **`DcsCalloopData`** (`src/main.rs:233`) — `{ state: DcsState, display: Display<DcsState> }`,
+  - Helpers: `output_for_handle`/`output_for_handle_mut`/`device_for_handle` take an
+    `OutputHandle` (device index + CRTC) and resolve it to the output or device;
+    `validate_output_mode_change` and `commit_output_mode_change` forward to
+    the owning device. `OutputHandle` (`src/render/dcs_output.rs`) exists because CRTC
+    and connector handles are per-device DRM ids that two GPUs can reuse.
+- **`DcsCalloopData`** (`src/main.rs`) — `{ state: DcsState, display: Display<DcsState> }`,
   the value threaded through the calloop event loop.
 
-`main` (`src/main.rs:279`) does, in order:
+`main` (`src/main.rs`) does, in order:
 
-1. `DcsDevice::new` for the chosen DRM card (`--card N`, path, or `card0`
-   with `card1` fallback via `parse_drm_path`, `:246`), then one initial
-   `render()` so every display shows the splash immediately.
+1. `parse_card_selection` picks the cards: no argument opens every `/dev/dri/card*` device (`drm_card_paths`); `--card N` or a positional path
+   opens just that one. One `DcsDevice` per card, display numbers assigned
+   consecutively across devices, then one initial `render()` per device.
 2. Creates the calloop `EventLoop` and inserts three sources:
-   - the DRM notifier (`:305`): `DrmEvent::VBlank(crtc)` →
+   - one DRM notifier **per device**: `DrmEvent::VBlank(crtc)` → that device's
      `frame_submitted` (completes the page-flip cycle for that output);
-   - the Wayland display poll fd (`:329`) → `dispatch_clients`;
+   - the Wayland display poll fd (`src/main.rs`) → `dispatch_clients`;
    - a `ListeningSocketSource` named **`display-config-server-0`**
-     (`:387`) → `insert_client`.
+     (`src/main.rs`) → `insert_client`.
 3. Registers the Wayland globals:
-   - `ZwpDcsManager` v1 (`:340`) — always;
-   - `ZwpDcsQuadroSyncManager` v1 (`:345`) — **only** when framelock
-     hardware was detected (`DcsDevice.quadro_sync_state.is_some()`), so a
-     client can feature-detect QuadroSync by the global's presence;
-   - one `WlOutput` v4 per connected CRTC (`:378`), with the
-     `crtc::Handle` as the global's user data (`src/wl_output.rs`) — this is
-     the client's handle for naming a display in protocol requests;
-   - `DrmLeaseState::new` (`:356`), which itself publishes the standard
-     `wp_drm_lease_device_v1` global and advertises each connector
-     (`add_connector`, `:368`).
+   - `ZwpDcsManager` v1 — always;
+   - `ZwpDcsQuadroSyncManager` v1 — when **any** device has framelock
+     hardware, so a client can feature-detect QuadroSync by the global's presence;
+   - one `WlOutput` v4 per connected CRTC on every device, with an `OutputHandle`
+     (device index + CRTC) as the global's user data — this is the client's
+     handle for naming a display in protocol requests;
+   - `DrmLeaseState::new` runs once per device, publishing the standard
+     `wp_drm_lease_device_v1` global and advertising each device's connectors.
 4. Runs the loop. The **post-dispatch callback ordering matters**
-   (`:415-425`): `dispatch_clients` → per-device `render()` →
+   (`src/main.rs`): `dispatch_clients` → per-device `render()` →
    `flush_clients`. Client requests processed in a batch (e.g. a topology
    commit that changed a mode) are therefore rendered — and their staged
    atomic state actually committed to KMS — in the *same* loop iteration.
@@ -132,17 +132,21 @@ during protocol dispatch and applied in one validated batch on commit.
   fn validate(&self, output: &DcsOutput) -> anyhow::Result<()>;
   fn apply(&self, output: &mut DcsOutput) -> anyhow::Result<()>;
   ```
-- **`trait TopologyAttribute`** (`src/attribute/mod.rs:42`) — a cross-display
-  setting that must see the whole device:
+- **`trait TopologyAttribute`** (`src/attribute/mod.rs:41`) — a cross-display
+  setting. Each attribute owns a single device; `display_attributes()` returns
+  per-display settings keyed by `OutputHandle`, and `output_handles()` lets
+  `apply_topology` find the one device owning the attribute, rejecting topologies
+  that span GPUs (cross-GPU framelock is future work):
   ```rust
   fn name(&self) -> &str;
-  fn display_attributes(&self) -> &[(crtc::Handle, Box<dyn DisplayAttribute>)];
+  fn display_attributes(&self) -> &[(OutputHandle, Box<dyn DisplayAttribute>)];
+  fn output_handles(&self) -> Vec<OutputHandle>;
   fn validate(&self, device: &DcsDevice) -> anyhow::Result<()>;
   fn apply(&self, device: &mut DcsDevice) -> anyhow::Result<()>;
   ```
-- **`PendingCommit`** (`src/attribute/mod.rs:57`) — the staging container:
+- **`PendingCommit`** (`src/attribute/mod.rs:59`) — the staging container:
   `topology_attrs: Vec<Box<dyn TopologyAttribute>>` and
-  `display_attrs: Vec<(crtc::Handle, Box<dyn DisplayAttribute>)>`. It lives
+  `display_attrs: Vec<(OutputHandle, Box<dyn DisplayAttribute>)>`. It lives
   in `DcsState.pending_commit` and is drained by `apply_topology`.
 
 Implementations:
@@ -167,14 +171,14 @@ Core protocol (`src/protocol/zwp_display_config_server_v1.rs`):
 
 | User data | Attached to | Holds |
 |---|---|---|
-| `WlDcsOutput {crtc}` (`:59`) | `zwp_dcs_output` | Which display this object refers to. |
-| `Mutex<WlDcsDisplayConfiguration>` (`:73`) | `zwp_dcs_display_configuration` | `crtc`, `pending_mode: (w, h, refresh_mhz)`, `pending_number`, and `quadro_sync_config: Option<ZwpDcsQuadroSyncDisplayConfiguration>` — the link that lets commit find the QuadroSync extension of this config. |
-| `Mutex<WlDcsTopology>` (`:96`) | `zwp_dcs_topology` | `configurations: Vec<ZwpDcsDisplayConfiguration>` and `quadro_sync_topology: Option<ZwpDcsQuadroSyncTopology>`. |
+| `WlDcsOutput {handle}` | `zwp_dcs_output` | Which display (as an `OutputHandle`) this object refers to. |
+| `Mutex<WlDcsDisplayConfiguration>` | `zwp_dcs_display_configuration` | `handle` (OutputHandle), `pending_mode: (w, h, refresh_mhz)`, `pending_number`, and `quadro_sync_config: Option<ZwpDcsQuadroSyncDisplayConfiguration>` — the link that lets commit find the QuadroSync extension of this config. |
+| `Mutex<WlDcsTopology>` | `zwp_dcs_topology` | `configurations: Vec<ZwpDcsDisplayConfiguration>` and `quadro_sync_topology: Option<ZwpDcsQuadroSyncTopology>`. |
 
 Request handlers:
 
-- `GetOutput` (`:128`) — resolves the CRTC from the `wl_output` argument's
-  user data, then emits the output's info events: one `mode` event per
+- `GetOutput` — resolves the `OutputHandle` from the `wl_output` argument's user
+  data, then emits the output's info events: one `mode` event per
   **deduplicated** `(w, h, refresh)` (raw DRM mode lists can contain the
   same visible mode twice — EDID detailed timing vs. CEA block), tagged
   `current`/`preferred`/`none`, plus `device` (dev_t), `number`, `done`.
@@ -192,10 +196,9 @@ Request handlers:
 **`apply_topology`** (`:323`) is the heart of a commit:
 
 1. If the topology has a QuadroSync extension, collect each base config's
-   `quadro_sync_config` and call `build_quadro_sync_attribute`
-   (`src/protocol/zwp_dcs_quadro_sync_v1.rs:266`), which resolves each
-   config's CRTC → connector id and pushes a `QuadroSyncTopologyAttribute`
-   into `pending_commit`.
+   `quadro_sync_config` and call `build_quadro_sync_attribute`, which resolves
+   each config's `OutputHandle` to its connector id and pushes a
+   `QuadroSyncTopologyAttribute` into `pending_commit`.
 2. For each base configuration, push a `ModeAttribute` and/or
    `DisplayNumberAttribute` into `pending_commit` (`:352-378`).
 3. Run four phases over the drained `PendingCommit` (`:380-408`):
@@ -220,7 +223,7 @@ work.)
 
 DCS is the **lessor**. Smithay's `DrmLeaseState` implements the
 `wp_drm_lease_device_v1` protocol; DCS plugs in policy via
-`impl DrmLeaseHandler for DcsState` (`src/main.rs:155`):
+`impl DrmLeaseHandler for DcsState` (`src/main.rs`):
 
 - `lease_request` (`:164`) — finds the device owning the requested
   connectors and builds a `DrmLeaseBuilder` containing the connector, its
@@ -376,7 +379,7 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
    calls `apply_topology` (`:323`):
    - `build_quadro_sync_attribute` turns the staged QuadroSync state into a
      `QuadroSyncTopologyAttribute` in `pending_commit` (roles resolved
-     CRTC → connector id);
+     OutputHandle → connector id);
    - each base config contributes a `ModeAttribute` /
      `DisplayNumberAttribute`;
    - **validate topology attrs** (framelock: exactly one server, ≥1 client)
@@ -387,7 +390,7 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
    - Any validation failure aborts before anything is applied and the
      client gets `ConfigError::InvalidState` + `TopologyError::Failed`.
 9. Still in the same loop iteration (post-dispatch callback,
-   `src/main.rs:415`), `device.render()` runs: `reset_state()` forced full
+   `src/main.rs`), `device.render()` runs: `reset_state()` forced full
    damage, so `render_frame` produces a frame and `queue_frame` performs
    the **atomic KMS commit that carries the modeset**. The VBlank event
    then delivers `frame_submitted`, completing the flip.
@@ -416,7 +419,7 @@ the DCS integration lives in the NVIDIA driver's Vulkan WSI (bfm:
      `wp_drm_lease_device_v1`: `create_lease_request` → `request_connector`
      → `submit`;
    - **on the DCS side** this hits `DrmLeaseHandler::lease_request`
-     (`src/main.rs:164`), which grants a lease containing the connector,
+     (`src/main.rs`), which grants a lease containing the connector,
      CRTC, and primary plane; `new_active_lease` records it in
      `DcsOutput.active_lease`. DCS stops touching that CRTC (its render
      gate `needs_render` stays false).
@@ -443,7 +446,7 @@ the DCS integration lives in the NVIDIA driver's Vulkan WSI (bfm:
    owner of QuadroSync policy.
 6. **Teardown.** The app exits / destroys the swapchain; the lease fd
    closes, the Wayland lease object dies, and Smithay calls
-   `lease_destroyed` (`src/main.rs:214`): DCS clears `active_lease`, does
+   `lease_destroyed` (`src/main.rs`): DCS clears `active_lease`, does
    `request_redraw()` (`reset_state` + `needs_render`), and the next loop
    iteration repaints the splash with a plain page flip — the display stays
    lit throughout.

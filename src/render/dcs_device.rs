@@ -67,7 +67,10 @@ impl DcsDevice {
     ///
     /// Returns the device alongside the `DrmDeviceNotifier` that the caller
     /// must register with calloop to receive VBlank events.
-    pub fn new(drm_path: &str) -> anyhow::Result<(Self, DrmDeviceNotifier)> {
+    ///
+    /// Display numbers are assigned from `first_display_number` upward so
+    /// that numbers stay unique across devices.
+    pub fn new(drm_path: &str, first_display_number: i32) -> anyhow::Result<(Self, DrmDeviceNotifier)> {
         let drm_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -102,7 +105,7 @@ impl DcsDevice {
         let resources = drm_device.resource_handles()?;
         let mut outputs: HashMap<crtc::Handle, DcsOutput> = HashMap::new();
         let mut used_crtcs: HashSet<crtc::Handle> = HashSet::new();
-        let mut display_number: i32 = 1;
+        let mut display_number: i32 = first_display_number;
 
         // DCS_CONNECTOR=<id> limits DCS to a single connector for debugging.
         let filter_connector: Option<u32> = std::env::var("DCS_CONNECTOR")
