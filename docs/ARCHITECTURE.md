@@ -120,6 +120,16 @@ XML with `wayland-scanner` (`generate_server_code!` / `generate_client_code!`).
     - `primary_plane_with_claim` (`:306`) — hands the primary plane to the
       lease builder.
 
+### QuadroSync boards (`src/render/quadro_sync.rs`)
+
+Each nvidia-drm device reports at most one QuadroSync board (the one wired to
+its display engine) plus the GPU ids bound to it, and `GET_DEV_INFO` gives
+the device's own GPU id. At startup `group_boards` groups devices that list
+each other into `QuadroSyncBoard { id, device_indices }`, stored in
+`DcsState.quadro_sync_boards`. A single board bridging two GPUs becomes one
+board with two devices. Daisy-chained per-GPU boards become one board each.
+`framelock_index` is always 0 because each fd only sees its own board.
+
 ### The attribute system (`src/attribute/`)
 
 Configuration changes are modeled as *attributes* — small objects staged
@@ -133,16 +143,16 @@ during protocol dispatch and applied in one validated batch on commit.
   fn apply(&self, output: &mut DcsOutput) -> anyhow::Result<()>;
   ```
 - **`trait TopologyAttribute`** (`src/attribute/mod.rs:41`) — a cross-display
-  setting. Each attribute owns a single device; `display_attributes()` returns
-  per-display settings keyed by `OutputHandle`, and `output_handles()` lets
-  `apply_topology` find the one device owning the attribute, rejecting topologies
-  that span GPUs (cross-GPU framelock is future work):
+  setting. `display_attributes()` returns per-display settings keyed by
+  `OutputHandle`. `apply_topology` validates and applies each topology
+  attribute once against the whole `DcsState`. The attribute routes each
+  ioctl to the device that owns the connector:
   ```rust
   fn name(&self) -> &str;
   fn display_attributes(&self) -> &[(OutputHandle, Box<dyn DisplayAttribute>)];
   fn output_handles(&self) -> Vec<OutputHandle>;
-  fn validate(&self, device: &DcsDevice) -> anyhow::Result<()>;
-  fn apply(&self, device: &mut DcsDevice) -> anyhow::Result<()>;
+  fn validate(&self, state: &DcsState) -> anyhow::Result<()>;
+  fn apply(&self, state: &mut DcsState) -> anyhow::Result<()>;
   ```
 - **`PendingCommit`** (`src/attribute/mod.rs:59`) — the staging container:
   `topology_attrs: Vec<Box<dyn TopologyAttribute>>` and
@@ -156,7 +166,7 @@ Implementations:
 | `ModeAttribute {width, height, refresh_mhz}` | `src/attribute/mode.rs` | Delegates to `DcsOutput::test_mode_change_by_params` / `apply_mode_change_by_params` — resolution/refresh change with TEST_ONLY validation. |
 | `DisplayNumberAttribute {number}` | `src/attribute/display_number.rs` | Renumbers a display; apply updates `display_number` and re-renders. |
 | `QuadroSyncRoleAttribute {connector_id, role}` | `src/attribute/quadro_sync.rs:180` | Per-display framelock role. Its `DisplayAttribute` validate/apply are intentionally no-ops — the parent topology attribute applies roles, because framelock is inherently cross-display. |
-| `QuadroSyncTopologyAttribute` | `src/attribute/quadro_sync.rs:217` | The real framelock worker: `roles`, `sync_delay`, `polarity`, `house_sync_mode`, `sync_enable`, `framelock_index`. `validate` (`:240`) enforces exactly one server + ≥1 client when enabling sync. `apply` (`:273`) drives the hardware via custom nvidia-drm ioctls: disable sync → `SET_DISPLAY_CONFIG` per role → `SET_ATTRIBUTE` for delay/polarity/house-sync → re-enable sync on the server connector. |
+| `QuadroSyncTopologyAttribute` | `src/attribute/quadro_sync.rs:217` | The QuadroSync worker: `roles`, `sync_delay`, `polarity`, `house_sync_mode`, `sync_enable`, `framelock_index`. `validate` requires 0 or 1 servers across all GPUs and rejects roles on GPUs without QuadroSync hardware. `apply` runs one global sequence through `QuadroSyncIoctls`: disable sync on every role connector (each on its owning GPU's fd), set roles, apply board attributes to the server's board only, enable sync on the server then the clients, then one engagement check per board. |
 
 QuadroSync hardware detection (`QuadroSyncState`, `detect_quadro_sync`,
 `src/attribute/quadro_sync.rs:88/:95`) uses the `DRM_NVIDIA_FRAMELOCK_QUERY`
@@ -215,9 +225,9 @@ into the base object's user data (`GetConfiguration` → base config's
 `quadro_sync_config`, `:139-163`; `GetTopology` → base topology's
 `quadro_sync_topology`, `:101-118`) so that the single base `commit` covers
 everything. `SetRole`/`SetSyncDelay`/`SetPolarity`/`SetHouseSyncMode`/
-`SetSyncEnable` just stage values. (`GetOutput` currently reports
-placeholder `sync_status`/`role` events — live hardware readback is future
-work.)
+`SetSyncEnable` just stage values. `GetOutput` reports placeholder
+`sync_status`/`role` events and sends `board(id)` before `done` when the
+display's GPU is in a board (live hardware readback is future work).
 
 ### DRM leasing (server side)
 
@@ -300,7 +310,8 @@ Everything a client needs to talk to DCS, in five modules:
 
 - `show` — `connect()` → `quadro_sync_supported()` → `enumerate_outputs()`,
   prints each display's full mode list (`* ...[current]`, `[preferred]`),
-  its QuadroSync role/sync line when hardware is present, and a trailing
+  its QuadroSync role/sync line when hardware is present, the board number
+  when the display's GPU is in a board, and a trailing
   `QuadroSync: supported | not detected`.
 - `apply` — either `--config file.yaml` (parses `Config`, applies each
   `TopologyConfig` in order) or flags: repeated `--display N --mode WxH@R`

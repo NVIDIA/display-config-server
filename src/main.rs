@@ -60,6 +60,7 @@ use std::sync::Arc;
 
 use render::DcsDevice;
 use render::dcs_output::OutputHandle;
+use render::quadro_sync::{BoardMember, QuadroSyncBoard};
 use protocols::zwp_display_config_server_v1::zwp_dcs_manager::ZwpDcsManager;
 use smithay::{
     backend::drm::{DrmEvent, DrmNode},
@@ -101,12 +102,21 @@ impl ClientData for DcsClientState {
 /// Holds resources that live for the lifetime of the server.
 struct DcsState {
     devices: Vec<DcsDevice>,
+    /// QuadroSync boards discovered at startup, grouped from each device's
+    /// GPU id and its board's bound GPU ids. Empty when no device has
+    /// QuadroSync hardware.
+    quadro_sync_boards: Vec<QuadroSyncBoard>,
     /// Pending attribute changes accumulated by sub-protocol handlers before a
     /// topology commit fires.  `None` when no sub-protocol has staged changes.
     pending_commit: Option<attribute::PendingCommit>,
 }
 
 impl DcsState {
+    /// The board id the device at `device_index` is attached to, if any.
+    fn board_for_device(&self, device_index: usize) -> Option<u32> {
+        render::quadro_sync::board_for_device(&self.quadro_sync_boards, device_index)
+    }
+
     /// Resolve an [`OutputHandle`] to its `DcsOutput`. Indexes the owning device
     /// directly; never scans other devices, so colliding per-device CRTC
     /// handles cannot resolve to the wrong GPU.
@@ -327,6 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // when auto-enumerating, a GPU with no connected displays is skipped.
     let mut devices: Vec<DcsDevice> = Vec::new();
     let mut notifiers = Vec::new();
+    let mut opened_paths: Vec<String> = Vec::new();
     let mut next_display_number: i32 = 1;
     for path in &paths {
         info!("Initialising DRM device: {}", path);
@@ -336,6 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 next_display_number += device.outputs.len() as i32;
                 devices.push(device);
                 notifiers.push(notifier);
+                opened_paths.push(path.clone());
             }
             Err(e) if explicit => return Err(e.into()),
             Err(e) => tracing::warn!("Skipping {}: {:#}", path, e),
@@ -343,6 +355,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if devices.is_empty() {
         return Err("no usable DRM display devices found".into());
+    }
+
+    // Group devices into QuadroSync boards. A device with QuadroSync hardware
+    // reports its own GPU id and the ids bound to its board; mutual listing
+    // means a shared board.
+    let members: Vec<BoardMember> = devices
+        .iter()
+        .enumerate()
+        .filter_map(|(device_index, device)| {
+            device.quadro_sync_state.as_ref().map(|qs| BoardMember {
+                device_index,
+                gpu_id: qs.gpu_id,
+                gpu_ids: qs.gpu_ids.clone(),
+            })
+        })
+        .collect();
+    let quadro_sync_boards = render::quadro_sync::group_boards(&members);
+    for board in &quadro_sync_boards {
+        let cards: Vec<&str> = board
+            .device_indices
+            .iter()
+            .map(|&i| opened_paths[i].as_str())
+            .collect();
+        info!("QuadroSync board {}: GPUs {:?}", board.id, cards);
     }
 
     // -------------------------------------------------------------------------
@@ -459,7 +495,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------------
 
     let mut calloop_data = DcsCalloopData {
-        state: DcsState { devices, pending_commit: None },
+        state: DcsState { devices, quadro_sync_boards, pending_commit: None },
         display,
     };
 

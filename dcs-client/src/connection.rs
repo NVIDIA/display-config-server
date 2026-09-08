@@ -42,6 +42,8 @@ pub(crate) struct PendingOutput {
     pub qs_role: Option<u32>,
     /// Whether QuadroSync sync is currently active, if reported.
     pub qs_sync_active: Option<bool>,
+    /// QuadroSync board id, if the server reported one.
+    pub qs_board: Option<u32>,
 }
 
 /// A fully-resolved output: the raw `wl_output` proxy (needed for
@@ -319,6 +321,9 @@ impl Dispatch<ZwpDcsQuadroSyncOutput, usize> for ClientState {
             }
             zwp_dcs_quadro_sync_output::Event::Role { role } => {
                 pending.qs_role = Some(role.into());
+            }
+            zwp_dcs_quadro_sync_output::Event::Board { id } => {
+                pending.qs_board = Some(id);
             }
             zwp_dcs_quadro_sync_output::Event::Done => {}
         }

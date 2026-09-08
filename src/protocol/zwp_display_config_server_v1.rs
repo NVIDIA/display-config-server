@@ -377,19 +377,11 @@ impl DcsState {
             }
         }
 
-        // Phase 1: Validate topology attrs against the single device that owns
-        // all of their outputs. A topology spanning two GPUs is rejected here;
-        // cross-device framelock is a follow-on feature.
-        let mut topo_targets: Vec<usize> = Vec::with_capacity(commit.topology_attrs.len());
+        // Phase 1: Validate topology attrs across all devices.
         for topo_attr in &commit.topology_attrs {
-            let device_index = owning_device_index(&topo_attr.output_handles())
+            topo_attr
+                .validate(self)
                 .map_err(|e| (0, e.context(format!("{} topology", topo_attr.name()))))?;
-            let device = self
-                .devices
-                .get(device_index)
-                .ok_or_else(|| (0, anyhow!("no device at index {}", device_index)))?;
-            topo_attr.validate(device).map_err(|e| (0, e))?;
-            topo_targets.push(device_index);
         }
 
         // Phase 2: Validate standalone display attrs.
@@ -401,10 +393,9 @@ impl DcsState {
             }
         }
 
-        // Phase 3: Apply topology attrs to their owning device.
-        for (topo_attr, &device_index) in commit.topology_attrs.iter().zip(&topo_targets) {
-            let device = &mut self.devices[device_index];
-            topo_attr.apply(device).map_err(|e| (0, e))?;
+        // Phase 3: Apply topology attrs (each routes to the devices it needs).
+        for topo_attr in &commit.topology_attrs {
+            topo_attr.apply(self).map_err(|e| (0, e))?;
         }
 
         // Phase 4: Apply standalone display attrs.
@@ -415,48 +406,5 @@ impl DcsState {
         }
 
         Ok(())
-    }
-}
-
-/// The single device that owns every handle, or an error when the handles are empty
-/// or span more than one device.
-fn owning_device_index(handles: &[OutputHandle]) -> anyhow::Result<usize> {
-    let mut indices: Vec<usize> = handles.iter().map(|k| k.device_index).collect();
-    indices.sort_unstable();
-    indices.dedup();
-    match indices.as_slice() {
-        [] => Err(anyhow!("topology attribute references no outputs")),
-        [one] => Ok(*one),
-        many => Err(anyhow!(
-            "topology spans {} GPUs (device indices {:?}); cross-GPU framelock is not supported yet",
-            many.len(),
-            many
-        )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::num::NonZeroU32;
-
-    fn handle(device_index: usize, raw_crtc: u32) -> OutputHandle {
-        OutputHandle::new(device_index, drm::control::crtc::Handle::from(NonZeroU32::new(raw_crtc).unwrap()))
-    }
-
-    #[test]
-    fn owning_device_single_device() {
-        assert_eq!(owning_device_index(&[handle(1, 5), handle(1, 6)]).unwrap(), 1);
-    }
-
-    #[test]
-    fn owning_device_rejects_empty() {
-        assert!(owning_device_index(&[]).is_err());
-    }
-
-    #[test]
-    fn owning_device_rejects_span() {
-        let err = owning_device_index(&[handle(0, 5), handle(1, 5)]).unwrap_err();
-        assert!(err.to_string().contains("spans 2 GPUs"), "{}", err);
     }
 }

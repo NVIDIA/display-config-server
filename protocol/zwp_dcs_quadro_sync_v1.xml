@@ -75,6 +75,15 @@
       <arg name="role" type="uint" enum="role" summary="current role"/>
     </event>
 
+    <event name="board">
+      <description summary="QuadroSync board this display's GPU is attached to">
+        Small integer identifying the board, stable for the lifetime of the
+        server. Displays with the same id share one QuadroSync board. Not sent
+        for a display whose GPU has no QuadroSync hardware.
+      </description>
+      <arg name="id" type="uint" summary="board id"/>
+    </event>
+
     <event name="done">
       <description summary="all QuadroSync output state sent"/>
     </event>

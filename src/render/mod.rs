@@ -2,5 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod dcs_device;
 pub mod dcs_output;
+pub mod quadro_sync;
 
 pub use dcs_device::DcsDevice;

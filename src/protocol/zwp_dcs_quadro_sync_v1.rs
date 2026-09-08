@@ -98,6 +98,9 @@ impl Dispatch<ZwpDcsQuadroSyncManager, ()> for DcsState {
 
                         resource.sync_status(engaged as u32);
                         resource.role(role);
+                        if let Some(board) = state.board_for_device(handle.device_index) {
+                            resource.board(board);
+                        }
                         resource.done();
                     }
                 }

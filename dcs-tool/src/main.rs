@@ -168,7 +168,10 @@ fn cmd_show() -> anyhow::Result<()> {
                     QuadroSyncRole::Client => "client",
                 };
                 let sync = if qs.sync_active { "active" } else { "inactive" };
-                println!("  QuadroSync role: {}, sync: {}", role, sync);
+                match qs.board {
+                    Some(board) => println!("  QuadroSync role: {}, sync: {}, board: {}", role, sync, board),
+                    None => println!("  QuadroSync role: {}, sync: {}", role, sync),
+                }
             }
         }
     }

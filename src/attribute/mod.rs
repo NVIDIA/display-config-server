@@ -15,7 +15,7 @@ pub mod quadro_sync;
 
 use crate::render::dcs_output::OutputHandle;
 use crate::render::dcs_output::DcsOutput;
-use crate::render::DcsDevice;
+use crate::DcsState;
 
 /// A per-output attribute that configures one display.
 ///
@@ -32,7 +32,8 @@ pub trait DisplayAttribute: Send + Sync {
     fn apply(&self, output: &mut DcsOutput) -> anyhow::Result<()>;
 }
 
-/// A cross-output attribute that configures a feature spanning multiple displays.
+/// A cross-output attribute that configures a feature that may span every
+/// device DCS manages.
 ///
 /// Owns child [`DisplayAttribute`]s representing the per-output settings that
 /// this topology attribute controls.  [`apply()`](TopologyAttribute::apply) is
@@ -43,13 +44,14 @@ pub trait TopologyAttribute: Send + Sync {
     fn name(&self) -> &str;
     /// Per-output attributes owned by this topology attribute.
     fn display_attributes(&self) -> &[(OutputHandle, Box<dyn DisplayAttribute>)];
-    /// Every output this topology attribute touches. Used by the commit path
-    /// to find the single device that owns them all.
+    /// Every output this topology attribute touches, possibly across devices.
     fn output_handles(&self) -> Vec<OutputHandle>;
-    /// Validate cross-output invariants (e.g., exactly one server).
-    fn validate(&self, device: &DcsDevice) -> anyhow::Result<()>;
-    /// Apply this attribute, including all owned child display attributes.
-    fn apply(&self, device: &mut DcsDevice) -> anyhow::Result<()>;
+    /// Validate cross-output invariants (e.g., exactly one server) against
+    /// every device DCS manages.
+    fn validate(&self, state: &DcsState) -> anyhow::Result<()>;
+    /// Apply this attribute across devices, including all owned child display
+    /// attributes.
+    fn apply(&self, state: &mut DcsState) -> anyhow::Result<()>;
 }
 
 /// Accumulated attribute changes, applied atomically on topology commit.

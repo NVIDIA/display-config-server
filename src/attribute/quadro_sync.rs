@@ -8,7 +8,9 @@ use anyhow::{anyhow, Context};
 
 use crate::render::dcs_output::OutputHandle;
 use crate::render::dcs_output::DcsOutput;
+use crate::render::quadro_sync::{board_for_device, QuadroSyncBoard};
 use crate::render::DcsDevice;
+use crate::DcsState;
 use super::{DisplayAttribute, TopologyAttribute};
 
 // ---------------------------------------------------------------------------
@@ -18,6 +20,7 @@ use super::{DisplayAttribute, TopologyAttribute};
 // DRM_COMMAND_BASE is 0x40 on Linux and FreeBSD for nvidia-drm
 const DRM_COMMAND_BASE: u32 = 0x40;
 
+const DRM_NVIDIA_GET_DEV_INFO: u32 = 0x03;
 const DRM_NVIDIA_FRAMELOCK_QUERY: u32 = 0x1f;
 const DRM_NVIDIA_FRAMELOCK_SET_ATTRIBUTE: u32 = 0x20;
 const DRM_NVIDIA_FRAMELOCK_GET_ATTRIBUTE: u32 = 0x21;
@@ -77,6 +80,19 @@ struct DrmNvidiaFramelockGetDisplaySyncParams {
     enabled: u32,
 }
 
+#[repr(C)]
+struct DrmNvidiaGetDevInfoParams {
+    gpu_id: u32,
+    mig_device: u32,
+    primary_index: u32,
+    supports_alloc: u32,
+    generic_page_kind: u32,
+    page_kind_generation: u32,
+    sector_layout: u32,
+    supports_sync_fd: u32,
+    supports_semsurf: u32,
+}
+
 /// Build a DRM IOWR ioctl request number.
 /// _IOWR('d', DRM_COMMAND_BASE + nr, T)
 fn drm_iowr<T>(nr: u32) -> libc::c_ulong {
@@ -107,9 +123,36 @@ fn nvidia_drm_ioctl<T>(fd: RawFd, request: libc::c_ulong, arg: &mut T) -> anyhow
 // Hardware detection
 // ---------------------------------------------------------------------------
 
+/// The nvidia-drm GPU id of the device behind `drm_fd`. This is the same id
+/// space as `QuadroSyncState::gpu_ids`, so it tells which board entries refer
+/// to this device.
+pub fn query_gpu_id(drm_fd: RawFd) -> anyhow::Result<u32> {
+    let mut params = DrmNvidiaGetDevInfoParams {
+        gpu_id: 0,
+        mig_device: 0,
+        primary_index: 0,
+        supports_alloc: 0,
+        generic_page_kind: 0,
+        page_kind_generation: 0,
+        sector_layout: 0,
+        supports_sync_fd: 0,
+        supports_semsurf: 0,
+    };
+    nvidia_drm_ioctl(
+        drm_fd,
+        drm_iowr::<DrmNvidiaGetDevInfoParams>(DRM_NVIDIA_GET_DEV_INFO),
+        &mut params,
+    )
+    .context("DRM_IOCTL_NVIDIA_GET_DEV_INFO")?;
+    Ok(params.gpu_id)
+}
+
 /// Persistent QuadroSync hardware state, populated at DcsDevice startup.
 pub struct QuadroSyncState {
     pub num_boards: u32,
+    /// This device's own GPU id (from GET_DEV_INFO).
+    pub gpu_id: u32,
+    /// GPU ids bound to the QuadroSync board attached to this device.
     pub gpu_ids: Vec<u32>,
 }
 
@@ -141,8 +184,20 @@ pub fn detect_quadro_sync(drm_fd: RawFd) -> Option<QuadroSyncState> {
         .filter(|&id| id != 0)
         .collect();
 
+    let gpu_id = match query_gpu_id(drm_fd) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                "RTX PRO Sync: board detected but GPU id query failed ({}); QuadroSync disabled on this device",
+                e
+            );
+            return None;
+        }
+    };
+
     Some(QuadroSyncState {
         num_boards: params.num_framelocks,
+        gpu_id,
         gpu_ids,
     })
 }
@@ -365,15 +420,18 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
         self.roles.iter().map(|(handle, _)| *handle).collect()
     }
 
-    fn validate(&self, device: &DcsDevice) -> anyhow::Result<()> {
+    fn validate(&self, state: &DcsState) -> anyhow::Result<()> {
         let mut servers = 0u32;
         let mut clients = 0u32;
 
         for (handle, role_attr) in &self.roles {
-            if !device.outputs.contains_key(&handle.crtc) {
+            let output = state
+                .output_for_handle(*handle)
+                .ok_or_else(|| anyhow!("QuadroSync role references unknown output {:?}", handle))?;
+            if state.board_for_device(handle.device_index).is_none() {
                 return Err(anyhow!(
-                    "QuadroSync role references unknown CRTC {:?}",
-                    handle.crtc
+                    "display {} is on a GPU without QuadroSync hardware and cannot take a QuadroSync role",
+                    output.display_number
                 ));
             }
             match role_attr.role {
@@ -386,162 +444,113 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
         validate_role_counts(servers, clients, self.sync_enable)
     }
 
-    fn apply(&self, device: &mut DcsDevice) -> anyhow::Result<()> {
-        use std::os::unix::io::{AsFd, AsRawFd};
+    fn apply(&self, state: &mut DcsState) -> anyhow::Result<()> {
+        let mut io = DrmQuadroSyncIoctls::new(&state.devices, self.framelock_index);
+        self.apply_with(&state.quadro_sync_boards, &mut io)
+    }
+}
 
-        let fd = device.drm_device.as_fd().as_raw_fd();
-
-        // Step 1: Disable sync before changing roles (best-effort). NVKMS
-        // rejects role changes while sync is enabled. The connector_id must
-        // be a real connector for the DRM lookup to succeed, so issue the
-        // disable per role-bearing connector.
-        for (_handle, role_attr) in &self.roles {
-            let mut params = DrmNvidiaFramelockSetDisplaySyncParams {
-                connector_id: role_attr.connector_id,
-                enable: 0,
-            };
-            let _ = nvidia_drm_ioctl(
-                fd,
-                drm_iow::<DrmNvidiaFramelockSetDisplaySyncParams>(
-                    DRM_NVIDIA_FRAMELOCK_SET_DISPLAY_SYNC,
-                ),
-                &mut params,
-            );
+impl QuadroSyncTopologyAttribute {
+    /// The global apply sequence, over any `QuadroSyncIoctls`. Each connector
+    /// ioctl goes to the device owning that connector; board attributes go to
+    /// the server's board only; sync is enabled on the server before clients;
+    /// engagement is checked once per board involved.
+    ///
+    /// If a step fails, sync stays disabled on every role connector (step 1
+    /// already ran) and any roles already set remain in place. Re-applying a
+    /// valid topology is the remedy.
+    pub fn apply_with(&self, boards: &[QuadroSyncBoard], io: &mut dyn QuadroSyncIoctls) -> anyhow::Result<()> {
+        // Step 1: Disable sync on every role connector first (best-effort).
+        // NVKMS rejects role changes while sync is enabled.
+        for (handle, role_attr) in &self.roles {
+            let _ = io.set_display_sync(handle.device_index, role_attr.connector_id, false);
         }
 
-        // Step 2: Set per-output roles
-        for (_handle, role_attr) in &self.roles {
+        // Step 2: Set roles, each on its owning device.
+        for (handle, role_attr) in &self.roles {
             tracing::info!(
-                "RTX PRO Sync: configuring connector {} as framelock {}",
+                "RTX PRO Sync: configuring connector {} on device {} as QuadroSync {}",
                 role_attr.connector_id,
+                handle.device_index,
                 role_attr.role.describe()
             );
-            let mut params = DrmNvidiaFramelockSetDisplayConfigParams {
-                connector_id: role_attr.connector_id,
-                config: role_attr.role.to_drm_config(),
-            };
-            nvidia_drm_ioctl(
-                fd,
-                drm_iow::<DrmNvidiaFramelockSetDisplayConfigParams>(
-                    DRM_NVIDIA_FRAMELOCK_SET_DISPLAY_CONFIG,
-                ),
-                &mut params,
-            )
-            .context("failed to set framelock display config")?;
+            io.set_display_config(handle.device_index, role_attr.connector_id, role_attr.role.to_drm_config())
+                .context("failed to set QuadroSync display config")?;
         }
 
-        // Step 3: Set board attributes
-        if let Some(delay) = self.sync_delay {
-            let mut params = DrmNvidiaFramelockSetAttributeParams {
-                framelock_index: self.framelock_index,
-                attribute: NV_KMS_FRAMELOCK_ATTRIBUTE_SYNC_DELAY,
-                value: delay as i64,
-            };
-            nvidia_drm_ioctl(
-                fd,
-                drm_iow::<DrmNvidiaFramelockSetAttributeParams>(
-                    DRM_NVIDIA_FRAMELOCK_SET_ATTRIBUTE,
-                ),
-                &mut params,
-            )
-            .context("failed to set framelock sync delay")?;
+        // Step 3: Board attributes on the server's board only. House sync,
+        // polarity, and delay are properties of the sync source; a client
+        // board locks to the incoming chain signal.
+        let server = self
+            .roles
+            .iter()
+            .find(|(_, r)| r.role == QuadroSyncRole::Server)
+            .map(|(handle, _)| *handle);
+        match server {
+            Some(server_handle) => {
+                let dev = server_handle.device_index;
+                if let Some(delay) = self.sync_delay {
+                    io.set_attribute(dev, NV_KMS_FRAMELOCK_ATTRIBUTE_SYNC_DELAY, delay as i64)
+                        .context("failed to set QuadroSync sync delay")?;
+                }
+                if let Some(polarity) = self.polarity {
+                    io.set_attribute(dev, NV_KMS_FRAMELOCK_ATTRIBUTE_POLARITY, polarity as i64)
+                        .context("failed to set QuadroSync polarity")?;
+                }
+                if let Some(house_sync) = self.house_sync_mode {
+                    io.set_attribute(dev, NV_KMS_FRAMELOCK_ATTRIBUTE_HOUSE_SYNC_MODE, house_sync as i64)
+                        .context("failed to set QuadroSync house sync mode")?;
+                }
+            }
+            None if self.sync_delay.is_some() || self.polarity.is_some() || self.house_sync_mode.is_some() => {
+                tracing::info!(
+                    "RTX PRO Sync: no local server; board attributes not applied because the sync source is on another system"
+                );
+            }
+            None => {}
         }
 
-        if let Some(polarity) = self.polarity {
-            let mut params = DrmNvidiaFramelockSetAttributeParams {
-                framelock_index: self.framelock_index,
-                attribute: NV_KMS_FRAMELOCK_ATTRIBUTE_POLARITY,
-                value: polarity as i64,
-            };
-            nvidia_drm_ioctl(
-                fd,
-                drm_iow::<DrmNvidiaFramelockSetAttributeParams>(
-                    DRM_NVIDIA_FRAMELOCK_SET_ATTRIBUTE,
-                ),
-                &mut params,
-            )
-            .context("failed to set framelock polarity")?;
-        }
-
-        if let Some(house_sync) = self.house_sync_mode {
-            let mut params = DrmNvidiaFramelockSetAttributeParams {
-                framelock_index: self.framelock_index,
-                attribute: NV_KMS_FRAMELOCK_ATTRIBUTE_HOUSE_SYNC_MODE,
-                value: house_sync as i64,
-            };
-            nvidia_drm_ioctl(
-                fd,
-                drm_iow::<DrmNvidiaFramelockSetAttributeParams>(
-                    DRM_NVIDIA_FRAMELOCK_SET_ATTRIBUTE,
-                ),
-                &mut params,
-            )
-            .context("failed to set framelock house sync mode")?;
-        }
-
-        // Step 4: Enable sync if requested. Sync is enabled on every
-        // connector with a role, server and clients alike, matching the
-        // nvidia-settings model. On a client-only system (multi-system
-        // framelock chain) the server lives on another machine.
+        let mut checked: Vec<u32> = Vec::new();
         if self.sync_enable {
-            let role_connectors: Vec<(u32, QuadroSyncRole)> = self
+            // Step 4: Enable sync, server first, then clients.
+            let active: Vec<&(OutputHandle, QuadroSyncRoleAttribute)> = self
                 .roles
                 .iter()
                 .filter(|(_, r)| r.role != QuadroSyncRole::Disabled)
-                .map(|(_, r)| (r.connector_id, r.role))
                 .collect();
-
-            let has_server = role_connectors
-                .iter()
-                .any(|(_, role)| *role == QuadroSyncRole::Server);
-
             tracing::info!(
-                "RTX PRO Sync: enabling sync on {} display(s), this system is a framelock {}",
-                role_connectors.len(),
-                if has_server {
-                    "server"
-                } else {
-                    "client, expecting sync signal from the chain"
-                }
+                "RTX PRO Sync: enabling sync on {} display(s), this system is a QuadroSync {}",
+                active.len(),
+                if server.is_some() { "server" } else { "client, expecting sync signal from the chain" }
             );
-
-            for (connector_id, _role) in &role_connectors {
-                let mut params = DrmNvidiaFramelockSetDisplaySyncParams {
-                    connector_id: *connector_id,
-                    enable: 1,
-                };
-                nvidia_drm_ioctl(
-                    fd,
-                    drm_iow::<DrmNvidiaFramelockSetDisplaySyncParams>(
-                        DRM_NVIDIA_FRAMELOCK_SET_DISPLAY_SYNC,
-                    ),
-                    &mut params,
-                )
-                .context("failed to enable framelock sync")?;
+            for (handle, role_attr) in active.iter().filter(|(_, r)| r.role == QuadroSyncRole::Server) {
+                io.set_display_sync(handle.device_index, role_attr.connector_id, true)
+                    .context("failed to enable QuadroSync sync on server")?;
+            }
+            for (handle, role_attr) in active.iter().filter(|(_, r)| r.role == QuadroSyncRole::Client) {
+                io.set_display_sync(handle.device_index, role_attr.connector_id, true)
+                    .context("failed to enable QuadroSync sync on client")?;
             }
 
-            // Log the initial engagement state. Locking can take a moment,
-            // especially for a client waiting on the incoming signal, so also
-            // arm a one-shot delayed re-check for the operator.
-            match get_sync_ready(fd, self.framelock_index) {
-                Ok(true) => tracing::info!("RTX PRO Sync: sync engaged"),
-                Ok(false) => {
-                    tracing::info!("RTX PRO Sync: sync not yet engaged, re-checking shortly")
+            // Step 5: One engagement check per board involved, on the first
+            // device we have for that board.
+            for (handle, _) in &active {
+                let Some(board) = board_for_device(boards, handle.device_index) else { continue };
+                if !checked.contains(&board) {
+                    checked.push(board);
+                    io.check_engagement(handle.device_index);
                 }
-                Err(e) => tracing::warn!("RTX PRO Sync: sync ready query failed: {}", e),
             }
-
-            spawn_engagement_check(fd, self.framelock_index);
         } else {
             tracing::info!("RTX PRO Sync: sync disabled");
         }
 
         tracing::info!(
-            "QuadroSync configuration applied: {} roles, sync_enable={}",
+            "QuadroSync configuration applied: {} roles across {} board(s), sync_enable={}",
             self.roles.len(),
+            checked.len(),
             self.sync_enable
         );
-
         Ok(())
     }
 }
@@ -574,9 +583,242 @@ fn spawn_engagement_check(fd: RawFd, framelock_index: u32) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// ioctl routing
+// ---------------------------------------------------------------------------
+
+/// The QuadroSync ioctls the topology apply needs, addressed by device index so
+/// each call lands on the fd of the GPU that owns the connector or board.
+/// Implemented for real DRM fds and for a recording fake in tests.
+pub trait QuadroSyncIoctls {
+    fn set_display_sync(&mut self, device_index: usize, connector_id: u32, enable: bool) -> anyhow::Result<()>;
+    fn set_display_config(&mut self, device_index: usize, connector_id: u32, config: u32) -> anyhow::Result<()>;
+    fn set_attribute(&mut self, device_index: usize, attribute: u32, value: i64) -> anyhow::Result<()>;
+    /// Log current engagement and arm the delayed re-check on this device's board.
+    fn check_engagement(&mut self, device_index: usize);
+}
+
+/// Real implementation over the DRM fds of `DcsState::devices`.
+pub struct DrmQuadroSyncIoctls<'a> {
+    devices: &'a [DcsDevice],
+    framelock_index: u32,
+}
+
+impl<'a> DrmQuadroSyncIoctls<'a> {
+    pub fn new(devices: &'a [DcsDevice], framelock_index: u32) -> Self {
+        Self { devices, framelock_index }
+    }
+
+    fn fd(&self, device_index: usize) -> anyhow::Result<RawFd> {
+        use std::os::unix::io::{AsFd, AsRawFd};
+        self.devices
+            .get(device_index)
+            .map(|d| d.drm_device.as_fd().as_raw_fd())
+            .ok_or_else(|| anyhow!("no device at index {}", device_index))
+    }
+}
+
+impl QuadroSyncIoctls for DrmQuadroSyncIoctls<'_> {
+    fn set_display_sync(&mut self, device_index: usize, connector_id: u32, enable: bool) -> anyhow::Result<()> {
+        let mut params = DrmNvidiaFramelockSetDisplaySyncParams { connector_id, enable: enable as u32 };
+        nvidia_drm_ioctl(
+            self.fd(device_index)?,
+            drm_iow::<DrmNvidiaFramelockSetDisplaySyncParams>(DRM_NVIDIA_FRAMELOCK_SET_DISPLAY_SYNC),
+            &mut params,
+        )
+        .with_context(|| format!("SET_DISPLAY_SYNC connector {} on device {}", connector_id, device_index))
+    }
+
+    fn set_display_config(&mut self, device_index: usize, connector_id: u32, config: u32) -> anyhow::Result<()> {
+        let mut params = DrmNvidiaFramelockSetDisplayConfigParams { connector_id, config };
+        nvidia_drm_ioctl(
+            self.fd(device_index)?,
+            drm_iow::<DrmNvidiaFramelockSetDisplayConfigParams>(DRM_NVIDIA_FRAMELOCK_SET_DISPLAY_CONFIG),
+            &mut params,
+        )
+        .with_context(|| format!("SET_DISPLAY_CONFIG connector {} on device {}", connector_id, device_index))
+    }
+
+    fn set_attribute(&mut self, device_index: usize, attribute: u32, value: i64) -> anyhow::Result<()> {
+        let mut params = DrmNvidiaFramelockSetAttributeParams {
+            framelock_index: self.framelock_index,
+            attribute,
+            value,
+        };
+        nvidia_drm_ioctl(
+            self.fd(device_index)?,
+            drm_iow::<DrmNvidiaFramelockSetAttributeParams>(DRM_NVIDIA_FRAMELOCK_SET_ATTRIBUTE),
+            &mut params,
+        )
+        .with_context(|| format!("SET_ATTRIBUTE {} on device {}", attribute, device_index))
+    }
+
+    fn check_engagement(&mut self, device_index: usize) {
+        let Ok(fd) = self.fd(device_index) else { return };
+        match get_sync_ready(fd, self.framelock_index) {
+            Ok(true) => tracing::info!("RTX PRO Sync: sync engaged on device {}", device_index),
+            Ok(false) => tracing::info!(
+                "RTX PRO Sync: sync not yet engaged on device {}, re-checking shortly",
+                device_index
+            ),
+            Err(e) => tracing::warn!("RTX PRO Sync: sync ready query failed on device {}: {}", device_index, e),
+        }
+        spawn_engagement_check(fd, self.framelock_index);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_role_counts;
+    use super::*;
+    use crate::render::quadro_sync::QuadroSyncBoard;
+    use crate::render::dcs_output::OutputHandle;
+    use std::num::NonZeroU32;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Call {
+        Sync { device: usize, connector: u32, enable: bool },
+        Config { device: usize, connector: u32, config: u32 },
+        Attr { device: usize, attribute: u32, value: i64 },
+        Engage { device: usize },
+    }
+
+    #[derive(Default)]
+    struct RecordingIoctls {
+        calls: Vec<Call>,
+    }
+
+    impl QuadroSyncIoctls for RecordingIoctls {
+        fn set_display_sync(&mut self, device_index: usize, connector_id: u32, enable: bool) -> anyhow::Result<()> {
+            self.calls.push(Call::Sync { device: device_index, connector: connector_id, enable });
+            Ok(())
+        }
+        fn set_display_config(&mut self, device_index: usize, connector_id: u32, config: u32) -> anyhow::Result<()> {
+            self.calls.push(Call::Config { device: device_index, connector: connector_id, config });
+            Ok(())
+        }
+        fn set_attribute(&mut self, device_index: usize, attribute: u32, value: i64) -> anyhow::Result<()> {
+            self.calls.push(Call::Attr { device: device_index, attribute, value });
+            Ok(())
+        }
+        fn check_engagement(&mut self, device_index: usize) {
+            self.calls.push(Call::Engage { device: device_index });
+        }
+    }
+
+    fn handle(device_index: usize, raw_crtc: u32) -> OutputHandle {
+        OutputHandle::new(device_index, drm::control::crtc::Handle::from(NonZeroU32::new(raw_crtc).unwrap()))
+    }
+
+    fn role(device_index: usize, connector_id: u32, role: QuadroSyncRole) -> (OutputHandle, QuadroSyncRoleAttribute) {
+        (handle(device_index, connector_id), QuadroSyncRoleAttribute { connector_id, role })
+    }
+
+    fn two_boards() -> Vec<QuadroSyncBoard> {
+        vec![
+            QuadroSyncBoard { id: 0, device_indices: vec![0] },
+            QuadroSyncBoard { id: 1, device_indices: vec![1] },
+        ]
+    }
+
+    fn one_bridging_board() -> Vec<QuadroSyncBoard> {
+        vec![QuadroSyncBoard { id: 0, device_indices: vec![0, 1] }]
+    }
+
+    fn attr(roles: Vec<(OutputHandle, QuadroSyncRoleAttribute)>, sync_enable: bool) -> QuadroSyncTopologyAttribute {
+        QuadroSyncTopologyAttribute {
+            roles,
+            sync_delay: Some(3),
+            polarity: None,
+            house_sync_mode: None,
+            sync_enable,
+            framelock_index: 0,
+        }
+    }
+
+    fn positions(calls: &[Call], pred: impl Fn(&Call) -> bool) -> Vec<usize> {
+        calls.iter().enumerate().filter(|(_, c)| pred(c)).map(|(i, _)| i).collect()
+    }
+
+    #[test]
+    fn disables_precede_all_role_sets_and_go_to_owning_device() {
+        let a = attr(vec![role(0, 10, QuadroSyncRole::Server), role(1, 20, QuadroSyncRole::Client)], true);
+        let mut io = RecordingIoctls::default();
+        a.apply_with(&two_boards(), &mut io).unwrap();
+
+        let disables = positions(&io.calls, |c| matches!(c, Call::Sync { enable: false, .. }));
+        let configs = positions(&io.calls, |c| matches!(c, Call::Config { .. }));
+        assert_eq!(disables.len(), 2);
+        assert!(disables.iter().max() < configs.iter().min(), "{:?}", io.calls);
+        assert!(io.calls.contains(&Call::Sync { device: 0, connector: 10, enable: false }));
+        assert!(io.calls.contains(&Call::Sync { device: 1, connector: 20, enable: false }));
+        assert!(io.calls.contains(&Call::Config { device: 1, connector: 20, config: FRAMELOCK_DISPLAY_CONFIG_CLIENT }));
+    }
+
+    #[test]
+    fn board_attributes_go_only_to_servers_board() {
+        // Server on device 1 (board 1); client on device 0 (board 0).
+        let a = attr(vec![role(0, 10, QuadroSyncRole::Client), role(1, 20, QuadroSyncRole::Server)], true);
+        let mut io = RecordingIoctls::default();
+        a.apply_with(&two_boards(), &mut io).unwrap();
+        let attrs: Vec<&Call> = io.calls.iter().filter(|c| matches!(c, Call::Attr { .. })).collect();
+        assert_eq!(attrs, vec![&Call::Attr { device: 1, attribute: NV_KMS_FRAMELOCK_ATTRIBUTE_SYNC_DELAY, value: 3 }]);
+    }
+
+    #[test]
+    fn no_local_server_means_no_board_attributes() {
+        let a = attr(vec![role(0, 10, QuadroSyncRole::Client), role(1, 20, QuadroSyncRole::Client)], true);
+        let mut io = RecordingIoctls::default();
+        a.apply_with(&two_boards(), &mut io).unwrap();
+        assert!(!io.calls.iter().any(|c| matches!(c, Call::Attr { .. })));
+    }
+
+    #[test]
+    fn server_enable_precedes_every_client_enable() {
+        let a = attr(
+            vec![role(0, 10, QuadroSyncRole::Client), role(1, 20, QuadroSyncRole::Server), role(1, 21, QuadroSyncRole::Client)],
+            true,
+        );
+        let mut io = RecordingIoctls::default();
+        a.apply_with(&two_boards(), &mut io).unwrap();
+        let server_on = positions(&io.calls, |c| matches!(c, Call::Sync { connector: 20, enable: true, .. }));
+        let client_on = positions(&io.calls, |c| matches!(c, Call::Sync { enable: true, connector, .. } if *connector != 20));
+        assert_eq!(server_on.len(), 1);
+        assert_eq!(client_on.len(), 2);
+        assert!(server_on[0] < *client_on.iter().min().unwrap(), "{:?}", io.calls);
+    }
+
+    #[test]
+    fn one_engagement_check_per_board() {
+        // Two devices on one bridging board: exactly one check.
+        let a = attr(vec![role(0, 10, QuadroSyncRole::Server), role(1, 20, QuadroSyncRole::Client)], true);
+        let mut io = RecordingIoctls::default();
+        a.apply_with(&one_bridging_board(), &mut io).unwrap();
+        assert_eq!(io.calls.iter().filter(|c| matches!(c, Call::Engage { .. })).count(), 1);
+
+        // Two devices on two boards: two checks.
+        let mut io = RecordingIoctls::default();
+        a.apply_with(&two_boards(), &mut io).unwrap();
+        assert_eq!(io.calls.iter().filter(|c| matches!(c, Call::Engage { .. })).count(), 2);
+    }
+
+    #[test]
+    fn sync_disabled_skips_enable_and_engagement() {
+        let a = attr(vec![role(0, 10, QuadroSyncRole::Server)], false);
+        let mut io = RecordingIoctls::default();
+        a.apply_with(&two_boards(), &mut io).unwrap();
+        assert!(!io.calls.iter().any(|c| matches!(c, Call::Sync { enable: true, .. } | Call::Engage { .. })));
+    }
+
+    #[test]
+    fn two_servers_across_devices_rejected() {
+        assert!(validate_role_counts(2, 0, true).is_err());
+    }
+
+    #[test]
+    fn get_dev_info_params_matches_kernel_layout() {
+        // struct drm_nvidia_get_dev_info_params: nine uint32_t fields.
+        assert_eq!(std::mem::size_of::<DrmNvidiaGetDevInfoParams>(), 9 * 4);
+    }
 
     #[test]
     fn sync_disabled_allows_anything() {

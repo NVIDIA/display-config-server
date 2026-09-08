@@ -27,6 +27,8 @@ pub struct QuadroSyncOutputInfo {
     pub role: QuadroSyncRole,
     /// True if framelock sync is currently active on this display.
     pub sync_active: bool,
+    /// QuadroSync board this display's GPU is attached to, if reported.
+    pub board: Option<u32>,
 }
 
 /// Current state of one DCS-managed display, as reported by the server.
@@ -105,6 +107,7 @@ impl DcsClient {
                         _ => QuadroSyncRole::Disabled,
                     },
                     sync_active: pending.qs_sync_active.unwrap_or(false),
+                    board: pending.qs_board,
                 }),
             };
             bound.push(BoundOutput {
