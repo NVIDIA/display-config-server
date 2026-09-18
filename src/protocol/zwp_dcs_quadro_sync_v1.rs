@@ -312,22 +312,20 @@ impl Dispatch<ZwpDcsQuadroSyncTopology, Mutex<WlQuadroSyncTopology>> for DcsStat
 
 impl DcsState {
     /// Build a [`QuadroSyncTopologyAttribute`] from the QuadroSync topology
-    /// resource associated with the given base topology and push it into
-    /// `pending_commit`.
+    /// resource associated with the given base topology.
     ///
     /// `qs_configs` are the QuadroSync display configurations collected from
     /// the base topology's registered configurations at commit time (each base
     /// configuration extended via `get_configuration` carries its QuadroSync
     /// companion in its user data).
     ///
-    /// Called by the base topology's `Commit` handler before `apply_topology`.
+    /// Called by the base topology's `Commit` handler, which owns the
+    /// [`PendingCommit`](crate::attribute::PendingCommit) the result goes into.
     pub fn build_quadro_sync_attribute(
-        &mut self,
+        &self,
         qs_topo_resource: &ZwpDcsQuadroSyncTopology,
         qs_configs: &[ZwpDcsQuadroSyncDisplayConfiguration],
-    ) -> anyhow::Result<()> {
-        use crate::attribute::PendingCommit;
-
+    ) -> anyhow::Result<QuadroSyncTopologyAttribute> {
         let topo = qs_topo_resource
             .data::<Mutex<WlQuadroSyncTopology>>()
             .ok_or_else(|| anyhow::anyhow!("QuadroSync topology has no user data"))?
@@ -365,20 +363,13 @@ impl DcsState {
             roles.push((handle, QuadroSyncRoleAttribute { connector_id, role }));
         }
 
-        let attr = QuadroSyncTopologyAttribute {
+        Ok(QuadroSyncTopologyAttribute {
             roles,
             sync_delay: topo.pending_sync_delay,
             polarity: topo.pending_polarity,
             house_sync_mode: topo.pending_house_sync_mode,
             sync_enable: topo.pending_sync_enable.unwrap_or(false),
             framelock_index: 0,
-        };
-
-        let commit = self
-            .pending_commit
-            .get_or_insert_with(PendingCommit::new);
-        commit.topology_attrs.push(Box::new(attr));
-
-        Ok(())
+        })
     }
 }

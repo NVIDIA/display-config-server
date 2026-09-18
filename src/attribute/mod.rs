@@ -56,8 +56,8 @@ pub trait TopologyAttribute: Send + Sync {
 
 /// Accumulated attribute changes, applied atomically on topology commit.
 ///
-/// Lives in [`DcsState`](crate::DcsState) because a topology commit can
-/// span multiple devices.
+/// Built and consumed entirely within the topology `Commit` handler; nothing
+/// outside that handler holds one.
 pub struct PendingCommit {
     /// Cross-output attributes (e.g., QuadroSync).  Each owns its child
     /// DisplayAttributes and applies them internally.

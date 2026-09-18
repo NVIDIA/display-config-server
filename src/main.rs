@@ -106,9 +106,6 @@ struct DcsState {
     /// GPU id and its board's bound GPU ids. Empty when no device has
     /// QuadroSync hardware.
     quadro_sync_boards: Vec<QuadroSyncBoard>,
-    /// Pending attribute changes accumulated by sub-protocol handlers before a
-    /// topology commit fires.  `None` when no sub-protocol has staged changes.
-    pending_commit: Option<attribute::PendingCommit>,
 }
 
 impl DcsState {
@@ -495,7 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------------
 
     let mut calloop_data = DcsCalloopData {
-        state: DcsState { devices, quadro_sync_boards, pending_commit: None },
+        state: DcsState { devices, quadro_sync_boards },
         display,
     };
 

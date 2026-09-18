@@ -308,9 +308,9 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
 impl DcsState {
     /// Apply every configuration in `topology` to the live display state.
     ///
-    /// Builds a [`PendingCommit`] from the protocol configurations, merges in
-    /// any topology attributes accumulated by sub-protocol handlers, then
-    /// validates and applies all attributes atomically:
+    /// Builds a [`PendingCommit`] from the protocol configurations and any
+    /// sub-protocol topology extensions attached to them, then validates and
+    /// applies all attributes atomically:
     ///
     /// 1. Validate topology attributes (cross-output invariants).
     /// 2. Validate standalone display attributes (mode tests, etc.).
@@ -327,9 +327,11 @@ impl DcsState {
             mode::ModeAttribute,
         };
 
+        let mut commit = PendingCommit::new();
+
         // If a QuadroSync topology extension is associated with this topology,
-        // build its attribute and stage it into pending_commit before processing
-        // the base configurations. The QuadroSync display configurations are
+        // build its attribute and add it to the commit before processing the
+        // base configurations. The QuadroSync display configurations are
         // reached through the base configurations registered on this topology:
         // each one that was extended via `get_configuration` carries its
         // QuadroSync companion in its user data.
@@ -343,13 +345,11 @@ impl DcsState {
                         .and_then(|d| d.lock().unwrap().quadro_sync_config.clone())
                 })
                 .collect();
-            self.build_quadro_sync_attribute(qs_topo, &qs_configs)
+            let attr = self
+                .build_quadro_sync_attribute(qs_topo, &qs_configs)
                 .map_err(|e| (0, e))?;
+            commit.topology_attrs.push(Box::new(attr));
         }
-
-        // Build PendingCommit from protocol configurations, merging in any
-        // topology attrs accumulated by sub-protocol handlers.
-        let mut commit = self.pending_commit.take().unwrap_or_else(PendingCommit::new);
 
         for (idx, config_resource) in topology.configurations.iter().enumerate() {
             let config = config_resource
