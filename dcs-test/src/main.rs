@@ -199,6 +199,7 @@ fn main() -> ExitCode {
             eprintln!("Options:");
             eprintln!("  --duration N          Exit after N seconds (default: run until Ctrl+C)");
             eprintln!("  --present-barrier     Synchronize presents with VK_NV_present_barrier");
+            eprintln!("  --debug               Print driver messages via VK_EXT_debug_utils");
             eprintln!("  --help                Show this help");
             return ExitCode::from(0);
         }

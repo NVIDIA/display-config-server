@@ -8,10 +8,11 @@
 //! Wayland lease protocol code here.
 
 use std::collections::HashSet;
-use std::ffi::CStr;
+use std::ffi::{c_void, CStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use ash::ext;
 use ash::khr;
 use ash::vk;
 
@@ -21,12 +22,15 @@ pub struct SampleOptions {
     pub duration: Option<Duration>,
     /// Enable VK_NV_present_barrier on every swapchain.
     pub present_barrier: bool,
+    /// Register a VK_EXT_debug_utils messenger and print driver messages.
+    pub debug: bool,
 }
 
 /// Parse the arguments following the `vulkan-sample` subcommand.
 pub fn parse_args(args: &[String]) -> Result<SampleOptions, String> {
     let mut duration = None;
     let mut present_barrier = false;
+    let mut debug = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -40,10 +44,11 @@ pub fn parse_args(args: &[String]) -> Result<SampleOptions, String> {
                 duration = Some(Duration::from_secs(secs));
             }
             "--present-barrier" => present_barrier = true,
+            "--debug" => debug = true,
             other => return Err(format!("unknown vulkan-sample argument: {}", other)),
         }
     }
-    Ok(SampleOptions { duration, present_barrier })
+    Ok(SampleOptions { duration, present_barrier, debug })
 }
 
 /// Seconds for one full hue sweep.  Slow enough to look smooth, fast
@@ -120,11 +125,27 @@ pub fn run(opts: &SampleOptions) -> Result<(), Box<dyn std::error::Error>> {
     if opts.present_barrier {
         instance_exts.push(khr::get_surface_capabilities2::NAME.as_ptr());
     }
+
+    // With --debug, enable VK_EXT_debug_utils when the loader offers it so
+    // the driver's own error and warning reports
+    // (VK_DEBUG_UTILS_MESSAGE_CODE_PLATFORM_NV and friends) show up on
+    // stderr instead of collapsing into a bare VK_ERROR_UNKNOWN.
+    let debug_utils = opts.debug && debug_utils_available(&entry);
+    if debug_utils {
+        instance_exts.push(ext::debug_utils::NAME.as_ptr());
+    }
+    let mut debug_info = debug_messenger_create_info();
+
     let app_info = vk::ApplicationInfo::default()
         .api_version(vk::make_api_version(0, 1, 1, 0));
-    let instance_info = vk::InstanceCreateInfo::default()
+    let mut instance_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
         .enabled_extension_names(&instance_exts);
+    if debug_utils {
+        // Chaining the messenger info here also catches messages emitted
+        // during vkCreateInstance itself.
+        instance_info = instance_info.push_next(&mut debug_info);
+    }
     let instance = unsafe { entry.create_instance(&instance_info, None) }.map_err(|e| {
         format!(
             "failed to create Vulkan instance (is a driver with VK_KHR_display available?): {}",
@@ -132,9 +153,97 @@ pub fn run(opts: &SampleOptions) -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
 
+    let messenger = if debug_utils {
+        let debug_fn = ext::debug_utils::Instance::new(&entry, &instance);
+        match unsafe { debug_fn.create_debug_utils_messenger(&debug_info, None) } {
+            Ok(m) => Some((debug_fn, m)),
+            Err(e) => {
+                eprintln!("vulkan-sample: failed to create debug messenger: {}", e);
+                None
+            }
+        }
+    } else {
+        if opts.debug {
+            eprintln!("vulkan-sample: VK_EXT_debug_utils not available, driver messages will not be shown");
+        }
+        None
+    };
+
     let result = run_with_instance(opts, &entry, &instance);
+    if let Some((debug_fn, m)) = messenger {
+        unsafe { debug_fn.destroy_debug_utils_messenger(m, None) };
+    }
     unsafe { instance.destroy_instance(None) };
     result
+}
+
+/// Whether the loader exposes VK_EXT_debug_utils at the instance level.
+fn debug_utils_available(entry: &ash::Entry) -> bool {
+    let props = match unsafe { entry.enumerate_instance_extension_properties(None) } {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    props.iter().any(|p| {
+        p.extension_name_as_c_str()
+            .map(|n| n == ext::debug_utils::NAME)
+            .unwrap_or(false)
+    })
+}
+
+/// Messenger config: every severity and every type, routed to
+/// `debug_callback`.
+fn debug_messenger_create_info() -> vk::DebugUtilsMessengerCreateInfoEXT<'static> {
+    vk::DebugUtilsMessengerCreateInfoEXT::default()
+        .message_severity(
+            vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+        )
+        .message_type(
+            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+        )
+        .pfn_user_callback(Some(debug_callback))
+}
+
+/// Print a VK_EXT_debug_utils message to stderr.
+unsafe extern "system" fn debug_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    msg_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+    _user_data: *mut c_void,
+) -> vk::Bool32 {
+    if data.is_null() {
+        return vk::FALSE;
+    }
+    let data = &*data;
+    let message = data
+        .message_as_c_str()
+        .map(|m| m.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id_name = data
+        .message_id_name_as_c_str()
+        .map(|m| m.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let sev = if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        "ERROR"
+    } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+        "WARNING"
+    } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
+        "INFO"
+    } else {
+        "VERBOSE"
+    };
+
+    if id_name.is_empty() {
+        eprintln!("vulkan-sample: driver {} [{:?}] (0x{:x}): {}", sev, msg_type, data.message_id_number, message);
+    } else {
+        eprintln!("vulkan-sample: driver {} [{:?}] {}: {}", sev, msg_type, id_name, message);
+    }
+    vk::FALSE
 }
 
 fn run_with_instance(
