@@ -70,7 +70,13 @@ impl DcsDevice {
     ///
     /// Display numbers are assigned from `first_display_number` upward so
     /// that numbers stay unique across devices.
-    pub fn new(drm_path: &str, first_display_number: i32) -> anyhow::Result<(Self, DrmDeviceNotifier)> {
+    /// `filter_connector` limits DCS to the connector with that DRM object id,
+    /// for debugging. `None` initialises every connected connector.
+    pub fn new(
+        drm_path: &str,
+        first_display_number: i32,
+        filter_connector: Option<u32>,
+    ) -> anyhow::Result<(Self, DrmDeviceNotifier)> {
         let drm_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -107,18 +113,14 @@ impl DcsDevice {
         let mut used_crtcs: HashSet<crtc::Handle> = HashSet::new();
         let mut display_number: i32 = first_display_number;
 
-        // DCS_CONNECTOR=<id> limits DCS to a single connector for debugging.
-        let filter_connector: Option<u32> = std::env::var("DCS_CONNECTOR")
-            .ok()
-            .and_then(|s| s.parse().ok());
         if let Some(id) = filter_connector {
-            tracing::info!("DCS_CONNECTOR={} — only initialising that connector", id);
+            tracing::info!("--connector {}: only initialising that connector", id);
         }
 
         for &connector_handle in resources.connectors() {
             let raw_id: u32 = connector_handle.into();
             if let Some(id) = filter_connector {
-                tracing::info!("DCS_CONNECTOR filter: connector raw_id={} vs filter={}", raw_id, id);
+                tracing::info!("--connector filter: connector raw_id={} vs filter={}", raw_id, id);
                 if raw_id != id {
                     continue;
                 }

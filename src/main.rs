@@ -249,6 +249,38 @@ struct DcsCalloopData {
     display: Display<DcsState>,
 }
 
+/// Command line for display-config-server.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "display-config-server",
+    about = "Wayland compositor that owns and leases out displays for Vulkan direct-to-display clients"
+)]
+struct Cli {
+    /// Open only /dev/dri/card<N>. Without this or DEVICE, every DRM card is opened.
+    #[arg(long, value_name = "N", conflicts_with = "device")]
+    card: Option<u32>,
+
+    /// Open only this DRM device path, e.g. /dev/dri/card1.
+    #[arg(value_name = "DEVICE")]
+    device: Option<String>,
+
+    /// Only initialise the connector with this DRM object id on each opened card.
+    #[arg(long, value_name = "ID")]
+    connector: Option<u32>,
+}
+
+impl Cli {
+    fn card_selection(&self) -> CardSelection {
+        if let Some(n) = self.card {
+            CardSelection::Path(format!("/dev/dri/card{}", n))
+        } else if let Some(path) = &self.device {
+            CardSelection::Path(path.clone())
+        } else {
+            CardSelection::All
+        }
+    }
+}
+
 /// Which DRM cards DCS should open.
 #[derive(Debug)]
 enum CardSelection {
@@ -256,31 +288,6 @@ enum CardSelection {
     All,
     /// Open exactly this device path.
     Path(String),
-}
-
-/// Parse the command line (without argv[0]).
-///
-/// Supported forms:
-///   (nothing)           →  All /dev/dri/card* devices
-///   --card <N>          →  /dev/dri/cardN only
-///   /dev/dri/cardN      →  that path only (positional)
-fn parse_card_selection(args: &[String]) -> Result<CardSelection, String> {
-    let mut iter = args.iter();
-    let Some(arg) = iter.next() else {
-        return Ok(CardSelection::All);
-    };
-    match arg.as_str() {
-        "--card" => {
-            let n = iter
-                .next()
-                .ok_or_else(|| "--card requires a card number argument".to_string())?;
-            n.parse::<u32>()
-                .map_err(|_| format!("--card: '{}' is not a valid card number", n))?;
-            Ok(CardSelection::Path(format!("/dev/dri/card{}", n)))
-        }
-        path if !path.starts_with('-') => Ok(CardSelection::Path(path.to_string())),
-        unknown => Err(format!("unknown argument: {}", unknown)),
-    }
 }
 
 /// Every `/dev/dri/card*` primary node, sorted by card number so device
@@ -314,10 +321,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up tracing output. RUST_LOG controls the filter (e.g. RUST_LOG=debug).
     tracing_subscriber::fmt::init();
 
-    // Parse --card <N> to select /dev/dri/cardN, or accept a full device path
-    // as a positional argument. Defaults to opening every DRM card.
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
-    let selection = parse_card_selection(&cli_args)?;
+    // --card <N> selects /dev/dri/cardN, a positional DEVICE path selects that
+    // path, and with neither every DRM card is opened.
+    let cli = <Cli as clap::Parser>::parse();
+    let selection = cli.card_selection();
     let explicit = matches!(selection, CardSelection::Path(_));
     let paths: Vec<String> = match selection {
         CardSelection::Path(path) => vec![path],
@@ -338,7 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut next_display_number: i32 = 1;
     for path in &paths {
         info!("Initialising DRM device: {}", path);
-        match DcsDevice::new(path, next_display_number) {
+        match DcsDevice::new(path, next_display_number, cli.connector) {
             Ok((mut device, notifier)) => {
                 device.render().expect("initial render failed");
                 next_display_number += device.outputs.len() as i32;
@@ -520,19 +527,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+    fn parse(list: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("display-config-server").chain(list.iter().copied()))
     }
 
     #[test]
     fn no_args_selects_all_cards() {
-        assert!(matches!(parse_card_selection(&args(&[])).unwrap(), CardSelection::All));
+        assert!(matches!(parse(&[]).unwrap().card_selection(), CardSelection::All));
     }
 
     #[test]
     fn card_flag_selects_one_path() {
-        match parse_card_selection(&args(&["--card", "1"])).unwrap() {
+        match parse(&["--card", "1"]).unwrap().card_selection() {
             CardSelection::Path(p) => assert_eq!(p, "/dev/dri/card1"),
             other => panic!("expected Path, got {:?}", other),
         }
@@ -540,7 +548,7 @@ mod tests {
 
     #[test]
     fn positional_path_selects_that_path() {
-        match parse_card_selection(&args(&["/dev/dri/card3"])).unwrap() {
+        match parse(&["/dev/dri/card3"]).unwrap().card_selection() {
             CardSelection::Path(p) => assert_eq!(p, "/dev/dri/card3"),
             other => panic!("expected Path, got {:?}", other),
         }
@@ -548,16 +556,26 @@ mod tests {
 
     #[test]
     fn card_flag_requires_value() {
-        assert!(parse_card_selection(&args(&["--card"])).is_err());
+        assert!(parse(&["--card"]).is_err());
     }
 
     #[test]
     fn card_flag_rejects_non_numeric() {
-        assert!(parse_card_selection(&args(&["--card", "zero"])).is_err());
+        assert!(parse(&["--card", "zero"]).is_err());
+    }
+
+    #[test]
+    fn card_flag_and_path_conflict() {
+        assert!(parse(&["--card", "1", "/dev/dri/card3"]).is_err());
+    }
+
+    #[test]
+    fn connector_flag_parses() {
+        assert_eq!(parse(&["--connector", "95"]).unwrap().connector, Some(95));
     }
 
     #[test]
     fn unknown_flag_rejected() {
-        assert!(parse_card_selection(&args(&["--bogus"])).is_err());
+        assert!(parse(&["--bogus"]).is_err());
     }
 }

@@ -17,38 +17,24 @@ use ash::khr;
 use ash::vk;
 
 /// Options for the vulkan-sample subcommand.
+#[derive(clap::Args, Debug)]
 pub struct SampleOptions {
-    /// Exit after this long; `None` = run until Ctrl+C.
+    /// Exit after N seconds (default: run until Ctrl+C).
+    #[arg(long, value_name = "N", value_parser = parse_seconds)]
     pub duration: Option<Duration>,
-    /// Enable VK_NV_present_barrier on every swapchain.
+    /// Synchronize presents with VK_NV_present_barrier.
+    #[arg(long)]
     pub present_barrier: bool,
-    /// Register a VK_EXT_debug_utils messenger and print driver messages.
+    /// Print driver messages via VK_EXT_debug_utils.
+    #[arg(long)]
     pub debug: bool,
 }
 
-/// Parse the arguments following the `vulkan-sample` subcommand.
-pub fn parse_args(args: &[String]) -> Result<SampleOptions, String> {
-    let mut duration = None;
-    let mut present_barrier = false;
-    let mut debug = false;
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--duration" => {
-                let value = it
-                    .next()
-                    .ok_or_else(|| String::from("--duration requires a value in seconds"))?;
-                let secs: u64 = value
-                    .parse()
-                    .map_err(|_| format!("invalid --duration '{}': expected seconds", value))?;
-                duration = Some(Duration::from_secs(secs));
-            }
-            "--present-barrier" => present_barrier = true,
-            "--debug" => debug = true,
-            other => return Err(format!("unknown vulkan-sample argument: {}", other)),
-        }
-    }
-    Ok(SampleOptions { duration, present_barrier, debug })
+/// clap value parser for `--duration`: whole seconds.
+fn parse_seconds(s: &str) -> Result<Duration, String> {
+    s.parse::<u64>()
+        .map(Duration::from_secs)
+        .map_err(|_| format!("'{}' is not a number of seconds", s))
 }
 
 /// Seconds for one full hue sweep.  Slow enough to look smooth, fast
@@ -749,37 +735,44 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn strs(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+    /// Parse `vulkan-sample <args>` through the dcs-test command line.
+    fn parse(args: &[&str]) -> Result<SampleOptions, clap::Error> {
+        use clap::Parser;
+        let argv = ["dcs-test", "vulkan-sample"].into_iter().chain(args.iter().copied());
+        crate::Cli::try_parse_from(argv).map(|cli| match cli.command {
+            Some(crate::Command::VulkanSample(opts)) => opts,
+            other => panic!("expected vulkan-sample subcommand, got {:?}", other),
+        })
     }
 
     #[test]
     fn parse_defaults() {
-        let opts = parse_args(&[]).unwrap();
+        let opts = parse(&[]).unwrap();
         assert_eq!(opts.duration, None);
         assert!(!opts.present_barrier);
+        assert!(!opts.debug);
     }
 
     #[test]
     fn parse_duration_and_barrier() {
-        let opts = parse_args(&strs(&["--duration", "30", "--present-barrier"])).unwrap();
+        let opts = parse(&["--duration", "30", "--present-barrier"]).unwrap();
         assert_eq!(opts.duration, Some(Duration::from_secs(30)));
         assert!(opts.present_barrier);
     }
 
     #[test]
     fn parse_duration_missing_value() {
-        assert!(parse_args(&strs(&["--duration"])).is_err());
+        assert!(parse(&["--duration"]).is_err());
     }
 
     #[test]
     fn parse_duration_non_numeric() {
-        assert!(parse_args(&strs(&["--duration", "soon"])).is_err());
+        assert!(parse(&["--duration", "soon"]).is_err());
     }
 
     #[test]
     fn parse_unknown_flag() {
-        assert!(parse_args(&strs(&["--frobnicate"])).is_err());
+        assert!(parse(&["--frobnicate"]).is_err());
     }
 
     #[test]

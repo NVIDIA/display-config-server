@@ -186,30 +186,32 @@ fn run_crosscheck(
     );
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+/// Command line for dcs-test.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "dcs-test",
+    about = "Connects to the DCS Wayland socket (display-config-server-0, or WAYLAND_DISPLAY) \
+             and checks the protocol and Vulkan display enumeration"
+)]
+struct Cli {
+    /// Skip Vulkan tests, only check the DCS protocol.
+    #[arg(long)]
+    protocol_only: bool,
 
-    if args.first().map(String::as_str) == Some("vulkan-sample") {
-        let sub_args = &args[1..];
-        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
-            eprintln!("Usage: dcs-test vulkan-sample [OPTIONS]");
-            eprintln!();
-            eprintln!("Presents a color cycle to all VK_KHR_display displays.");
-            eprintln!();
-            eprintln!("Options:");
-            eprintln!("  --duration N          Exit after N seconds (default: run until Ctrl+C)");
-            eprintln!("  --present-barrier     Synchronize presents with VK_NV_present_barrier");
-            eprintln!("  --debug               Print driver messages via VK_EXT_debug_utils");
-            eprintln!("  --help                Show this help");
-            return ExitCode::from(0);
-        }
-        let opts = match vulkan_sample::parse_args(sub_args) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("error: {}", e);
-                return ExitCode::from(2);
-            }
-        };
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Present a color cycle to all displays (Vulkan direct-to-display).
+    VulkanSample(vulkan_sample::SampleOptions),
+}
+
+fn main() -> ExitCode {
+    let cli = <Cli as clap::Parser>::parse();
+
+    if let Some(Command::VulkanSample(opts)) = cli.command {
         return match vulkan_sample::run(&opts) {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
@@ -219,33 +221,7 @@ fn main() -> ExitCode {
         };
     }
 
-    let mut protocol_only = false;
-
-    for arg in &args {
-        match arg.as_str() {
-            "--protocol-only" => protocol_only = true,
-            "--help" | "-h" => {
-                eprintln!("Usage: dcs-test [OPTIONS]");
-                eprintln!();
-                eprintln!("Connects to the DCS Wayland socket (display-config-server-0)");
-                eprintln!("or the socket specified by WAYLAND_DISPLAY.");
-                eprintln!();
-                eprintln!("Options:");
-                eprintln!("  --protocol-only   Skip Vulkan tests, only check DCS protocol");
-                eprintln!("  --help            Show this help");
-                eprintln!();
-                eprintln!("Subcommands:");
-                eprintln!("  vulkan-sample     Present a color cycle to all displays (Vulkan D2D)");
-                eprintln!("    --duration N          Exit after N seconds (default: run until Ctrl+C)");
-                eprintln!("    --present-barrier     Synchronize presents with VK_NV_present_barrier");
-                return ExitCode::from(0);
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                return ExitCode::from(2);
-            }
-        }
-    }
+    let protocol_only = cli.protocol_only;
 
     let mut results = TestResults::new();
 

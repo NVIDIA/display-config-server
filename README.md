@@ -110,12 +110,13 @@ relevant development headers are installed for your distribution.
 ## Running
 
 ```
-display-config-server [--card N | /dev/dri/cardN]
+display-config-server [--card N | /dev/dri/cardN] [--connector ID]
 ```
 
 With no arguments, DCS opens every DRM card under /dev/dri and manages
 all of their connected displays. Pass --card N (or a device path) to restrict
-DCS to a single GPU.
+DCS to a single GPU. Pass --connector ID to initialise only the connector
+with that DRM object id, which is useful when debugging a single display.
 
 Log output is controlled by the `RUST_LOG` environment variable (e.g.
 `RUST_LOG=debug`).

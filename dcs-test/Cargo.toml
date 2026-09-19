@@ -7,4 +7,5 @@ edition = "2021"
 dcs-client = { path = "../dcs-client" }
 wayland-protocols = { version = "0.31", features = ["client"] }
 ash = "0.38"
+clap = { version = "4", features = ["derive"] }
 libc = "0.2"
