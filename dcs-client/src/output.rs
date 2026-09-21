@@ -36,8 +36,9 @@ pub struct QuadroSyncOutputInfo {
 pub struct OutputInfo {
     /// 1-based display index (from the `number` event).
     pub display_number: i32,
-    /// DRM device number (dev_t truncated to u32).
-    pub dev_t: u32,
+    /// DRM device number (st_rdev / dev_t of the DRM primary node), decoded
+    /// from the `device` event. `0` if the server did not report one.
+    pub dev_t: u64,
     /// All modes reported by the server for this output.
     pub modes: Vec<ModeInfo>,
     /// QuadroSync state; `None` if QuadroSync hardware is not present.
@@ -49,6 +50,25 @@ impl OutputInfo {
     pub fn current_mode(&self) -> Option<&ModeInfo> {
         self.modes.iter().find(|m| m.current)
     }
+}
+
+/// Decode the `zwp_dcs_output.device` payload.
+///
+/// The server sends `sizeof(dev_t)` bytes in native byte order, the same
+/// encoding `wp_linux_dmabuf_feedback.main_device` uses. Any width up to 64
+/// bits is accepted so the client does not bake in the server's dev_t size.
+/// Returns `None` for an empty or oversized payload.
+pub(crate) fn dev_t_from_bytes(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() || bytes.len() > std::mem::size_of::<u64>() {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    if cfg!(target_endian = "little") {
+        buf[..bytes.len()].copy_from_slice(bytes);
+    } else {
+        buf[8 - bytes.len()..].copy_from_slice(bytes);
+    }
+    Some(u64::from_ne_bytes(buf))
 }
 
 impl DcsClient {
@@ -134,5 +154,28 @@ impl DcsClient {
 
         self.state.bound_outputs = bound;
         Ok(infos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dev_t_from_bytes;
+
+    #[test]
+    fn dev_t_round_trips_native_u64() {
+        let value: u64 = 0x0000_0000_e200_0000;
+        assert_eq!(dev_t_from_bytes(&value.to_ne_bytes()), Some(value));
+    }
+
+    #[test]
+    fn dev_t_accepts_narrower_encodings() {
+        let value: u32 = 0xe200;
+        assert_eq!(dev_t_from_bytes(&value.to_ne_bytes()), Some(value as u64));
+    }
+
+    #[test]
+    fn dev_t_rejects_empty_and_oversized() {
+        assert_eq!(dev_t_from_bytes(&[]), None);
+        assert_eq!(dev_t_from_bytes(&[0u8; 9]), None);
     }
 }

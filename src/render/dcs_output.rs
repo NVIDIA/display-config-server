@@ -68,9 +68,9 @@ pub struct DcsOutput {
     pub mode_height: u32,
     /// Active mode refresh rate in mHz (e.g. 60000 for 60 Hz).
     pub mode_refresh_mhz: u32,
-    /// DRM device number (st_rdev / dev_t, truncated to 32 bits) sent as
-    /// the `device` event so clients can identify which GPU owns this output.
-    pub dev_t: u32,
+    /// DRM device number (st_rdev / dev_t of the primary node) sent as the
+    /// `device` event so clients can identify which GPU owns this output.
+    pub dev_t: u64,
 }
 
 /// Build a CPU-side splash screen `(w × h)` pixels in `Fourcc::Argb8888`
@@ -181,7 +181,7 @@ impl DcsOutput {
         icon_rgba: &[u8],
         used_crtcs: &HashSet<crtc::Handle>,
         display_number: i32,
-        dev_t: u32,
+        dev_t: u64,
     ) -> anyhow::Result<(crtc::Handle, Self)> {
         let connector_modes: Vec<drm::control::Mode> = connector_info.modes().to_vec();
         let mode = *connector_modes

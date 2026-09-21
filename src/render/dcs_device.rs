@@ -107,7 +107,7 @@ impl DcsDevice {
         // Enumerate connected connectors; create one DcsOutput per CRTC
         // ------------------------------------------------------------------ //
         let icon_rgba = decode_icon()?;
-        let dev_t = std::fs::metadata(drm_path)?.rdev() as u32;
+        let dev_t = std::fs::metadata(drm_path)?.rdev();
         let resources = drm_device.resource_handles()?;
         let mut outputs: HashMap<crtc::Handle, DcsOutput> = HashMap::new();
         let mut used_crtcs: HashSet<crtc::Handle> = HashSet::new();

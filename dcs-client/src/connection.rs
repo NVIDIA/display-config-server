@@ -35,7 +35,7 @@ const DCS_SOCKET: &str = "display-config-server-0";
 #[derive(Default, Clone)]
 pub(crate) struct PendingOutput {
     pub display_number: Option<i32>,
-    pub dev_t: Option<u32>,
+    pub dev_t: Option<u64>,
     pub modes: Vec<ModeInfo>,
     pub done: bool,
     /// QuadroSync role raw value (0=disabled, 1=server, 2=client), if reported.
@@ -231,7 +231,7 @@ impl Dispatch<ZwpDcsOutput, usize> for ClientState {
                 });
             }
             zwp_dcs_output::Event::Device { device } => {
-                pending.dev_t = Some(device);
+                pending.dev_t = crate::output::dev_t_from_bytes(&device);
             }
             zwp_dcs_output::Event::Number { display_number } => {
                 pending.display_number = Some(display_number);

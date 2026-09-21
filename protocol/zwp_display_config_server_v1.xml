@@ -125,10 +125,13 @@
 
     <event name="device">
       <description summary="the DRM device for this output">
-        The device that this output is connected to, expressed as a dev_t
-        device number.
+        The DRM device that drives this output. The array holds the dev_t of
+        the device's primary node as an array of sizeof(dev_t) bytes in
+        native byte order, the same encoding wp_linux_dmabuf_feedback uses
+        for main_device. Clients compare devices by value rather than by
+        node path, and must not assume a particular size for dev_t.
       </description>
-      <arg name="device" type="uint" summary="dev_t of the DRM device"/>
+      <arg name="device" type="array" summary="dev_t of the DRM device"/>
     </event>
 
     <event name="number">

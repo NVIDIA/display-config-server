@@ -178,7 +178,9 @@ impl Dispatch<ZwpDcsManager, ()> for DcsState {
                             };
                             resource.mode(flags, w as u32, h as u32, refresh_mhz);
                         }
-                        resource.device(dcs_out.dev_t);
+                        // dev_t goes over the wire as sizeof(dev_t) native-endian
+                        // bytes, matching wp_linux_dmabuf_feedback.main_device.
+                        resource.device(dcs_out.dev_t.to_ne_bytes().to_vec());
                         resource.number(dcs_out.display_number);
                         resource.done();
                     }

@@ -191,7 +191,7 @@ Request handlers:
   data, then emits the output's info events: one `mode` event per
   **deduplicated** `(w, h, refresh)` (raw DRM mode lists can contain the
   same visible mode twice — EDID detailed timing vs. CEA block), tagged
-  `current`/`preferred`/`none`, plus `device` (dev_t), `number`, `done`.
+  `current`/`preferred`/`none`, plus `device` (dev_t as a native-endian `wl_array`, like dmabuf `main_device`), `number`, `done`.
 - `CreateTopology` (`:174`), `CreateConfiguration` (`:202`) — create the
   staging objects.
 - `SetMode`/`SetNumber` (`:221`) — record pending values in the config's
