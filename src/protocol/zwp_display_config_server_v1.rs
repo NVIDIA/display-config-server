@@ -100,6 +100,20 @@ pub struct WlDcsTopology {
     pub quadro_sync_topology: Option<ZwpDcsQuadroSyncTopology>,
 }
 
+impl WlDcsTopology {
+    /// Forget any protocol objects the client has destroyed since we last
+    /// looked. A destroyed configuration leaves the topology, and a destroyed
+    /// QuadroSync extension no longer contributes to the commit, matching
+    /// the `destroy` semantics in the protocol. Called before every use of
+    /// the lists so a dead resource is never dereferenced.
+    pub fn prune_dead(&mut self) {
+        self.configurations.retain(|c| c.is_alive());
+        if self.quadro_sync_topology.as_ref().is_some_and(|t| !t.is_alive()) {
+            self.quadro_sync_topology = None;
+        }
+    }
+}
+
 impl GlobalDispatch<ZwpDcsManager, ()> for DcsState {
     fn bind(
         _state: &mut Self,
@@ -179,6 +193,8 @@ impl Dispatch<ZwpDcsManager, ()> for DcsState {
                     }),
                 );
             }
+            // Child objects stay valid; there is no manager-level state to drop.
+            zwp_dcs_manager::Request::Destroy => {}
         }
     }
 }
@@ -209,6 +225,7 @@ impl Dispatch<ZwpDcsOutput, WlDcsOutput> for DcsState {
                     }),
                 );
             }
+            zwp_dcs_output::Request::Destroy => {}
         }
     }
 }
@@ -239,6 +256,10 @@ impl Dispatch<ZwpDcsDisplayConfiguration, Mutex<WlDcsDisplayConfiguration>> for 
             zwp_dcs_display_configuration::Request::SetNumber { number } => {
                 config.pending_number = Some(number);
             }
+            // A topology that holds this configuration drops it the next time
+            // it looks at its list (see `WlDcsTopology::prune_dead`); the
+            // pending state dies with the resource's user data.
+            zwp_dcs_display_configuration::Request::Destroy => {}
         }
     }
 }
@@ -260,6 +281,7 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
         match request {
             zwp_dcs_topology::Request::AddConfiguration { config } => {
                 let mut topology = data.lock().unwrap();
+                topology.prune_dead();
 
                 // Reject the configuration if its output is already represented
                 // in this topology. Comparing by OutputHandle is sufficient
@@ -290,13 +312,17 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
                 topology.configurations.push(config);
             }
             zwp_dcs_topology::Request::Commit => {
-                let topology = data.lock().unwrap();
+                let mut topology = data.lock().unwrap();
+                topology.prune_dead();
                 if let Err((idx, e)) = state.apply_topology(&topology) {
                     tracing::error!("topology commit failed: {:#}", e);
                     topology.configurations[idx].error(ConfigError::InvalidState);
                     resource.error(TopologyError::Failed);
                 }
             }
+            // Configurations added here are separate objects the client still
+            // owns; nothing to release.
+            zwp_dcs_topology::Request::Destroy => {}
         }
     }
 }
@@ -344,6 +370,8 @@ impl DcsState {
                         .data::<Mutex<WlDcsDisplayConfiguration>>()
                         .and_then(|d| d.lock().unwrap().quadro_sync_config.clone())
                 })
+                // A destroyed QuadroSync configuration leaves the role alone.
+                .filter(|qs_config| qs_config.is_alive())
                 .collect();
             let attr = self
                 .build_quadro_sync_attribute(qs_topo, &qs_configs)

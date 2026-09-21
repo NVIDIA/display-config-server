@@ -42,8 +42,8 @@ XML with `wayland-scanner` (`generate_server_code!` / `generate_client_code!`).
 
 `main` (`src/main.rs`) does, in order:
 
-1. `parse_card_selection` picks the cards: no argument opens every `/dev/dri/card*` device (`drm_card_paths`); `--card N` or a positional path
-   opens just that one. One `DcsDevice` per card, display numbers assigned
+1. The clap-parsed `Cli` picks the cards: no argument opens every `/dev/dri/card*` device (`drm_card_paths`); `--card N` or a positional path
+   opens just that one, and `--connector ID` limits each card to one connector. One `DcsDevice` per card, display numbers assigned
    consecutively across devices, then one initial `render()` per device.
 2. Creates the calloop `EventLoop` and inserts three sources:
    - one DRM notifier **per device**: `DrmEvent::VBlank(crtc)` → that device's
@@ -378,15 +378,21 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
       `.get_configuration(&cfg)` → `.set_role(role)`.
    6. Reset the error flags, `wl_topology.commit()`, roundtrip, and fail if
       `topology_error`/`config_error` was set by an `Error` event.
+   7. Destroy every object created above, extensions first, then the base
+      objects, then the topology. Every DCS protocol object has a `destroy`
+      destructor; the server tolerates a configuration or QuadroSync
+      extension being destroyed while a topology still references it by
+      pruning dead resources before each `add_configuration` and `commit`
+      (`WlDcsTopology::prune_dead`).
 
 **Server side:**
 
-7. The socket fd wakes calloop; `dispatch_clients` runs every staged request
+8. The socket fd wakes calloop; `dispatch_clients` runs every staged request
    handler: user-data structs accumulate `pending_mode`, `pending_role`,
    board settings, and the QuadroSync↔base links
    (`WlDcsDisplayConfiguration.quadro_sync_config`,
    `WlDcsTopology.quadro_sync_topology`).
-8. The `Commit` handler (`src/protocol/zwp_display_config_server_v1.rs:292`)
+9. The `Commit` handler (`src/protocol/zwp_display_config_server_v1.rs:292`)
    calls `apply_topology` (`:323`):
    - `build_quadro_sync_attribute` turns the staged QuadroSync state into a
      `QuadroSyncTopologyAttribute` in `pending_commit` (roles resolved
@@ -400,12 +406,12 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
      (`apply_mode_change`: `use_mode` + `reset_state` + `needs_render`).
    - Any validation failure aborts before anything is applied and the
      client gets `ConfigError::InvalidState` + `TopologyError::Failed`.
-9. Still in the same loop iteration (post-dispatch callback,
+10. Still in the same loop iteration (post-dispatch callback,
    `src/main.rs`), `device.render()` runs: `reset_state()` forced full
    damage, so `render_frame` produces a frame and `queue_frame` performs
    the **atomic KMS commit that carries the modeset**. The VBlank event
    then delivers `frame_submitted`, completing the flip.
-10. `flush_clients` sends any error events; the client's roundtrip in step 6
+11. `flush_clients` sends any error events; the client's roundtrip in step 6
     returns and `dcs-tool` prints success or failure.
 
 ## Flow 2: a Vulkan ICD leasing and driving displays

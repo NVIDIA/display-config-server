@@ -124,6 +124,7 @@ impl Dispatch<ZwpDcsQuadroSyncManager, ()> for DcsState {
                     base.quadro_sync_topology = Some(qs_topo);
                 }
             }
+            zwp_dcs_quadro_sync_manager::Request::Destroy => {}
         }
     }
 }
@@ -220,6 +221,7 @@ impl Dispatch<ZwpDcsQuadroSyncOutput, WlQuadroSyncOutput> for DcsState {
                     );
                 }
             }
+            zwp_dcs_quadro_sync_output::Request::Destroy => {}
         }
     }
 }
@@ -252,6 +254,9 @@ impl Dispatch<ZwpDcsQuadroSyncDisplayConfiguration, Mutex<WlQuadroSyncDisplayCon
                     _ => None,
                 };
             }
+            // The base configuration checks `is_alive()` at commit and skips a
+            // destroyed extension, so the role is left unchanged.
+            zwp_dcs_quadro_sync_display_configuration::Request::Destroy => {}
         }
     }
 }
@@ -302,6 +307,8 @@ impl Dispatch<ZwpDcsQuadroSyncTopology, Mutex<WlQuadroSyncTopology>> for DcsStat
             zwp_dcs_quadro_sync_topology::Request::SetSyncEnable { enable } => {
                 topo.pending_sync_enable = Some(enable != 0);
             }
+            // The base topology prunes a destroyed extension before commit.
+            zwp_dcs_quadro_sync_topology::Request::Destroy => {}
         }
     }
 }

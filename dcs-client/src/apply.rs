@@ -71,6 +71,13 @@ impl DcsClient {
             }
         }
 
+        // Every protocol object created below is destroyed once the commit
+        // result is in, so a long-lived client does not leak server objects.
+        let mut created_outputs = Vec::new();
+        let mut created_configs = Vec::new();
+        let mut created_qs_outputs = Vec::new();
+        let mut created_qs_configs = Vec::new();
+
         for display in &topology.display {
             let bound = bound_outputs
                 .iter()
@@ -101,7 +108,12 @@ impl DcsClient {
                     QuadroSyncRole::Server => ProtoRole::Server,
                     QuadroSyncRole::Client => ProtoRole::Client,
                 });
+                created_qs_outputs.push(qs_out);
+                created_qs_configs.push(qs_cfg);
             }
+
+            created_outputs.push(dcs_out);
+            created_configs.push(cfg);
         }
 
         // Reset error flags before commit.
@@ -110,9 +122,31 @@ impl DcsClient {
 
         wl_topology.commit();
 
-        self.event_queue
+        let roundtrip = self
+            .event_queue
             .roundtrip(&mut self.state)
-            .context("roundtrip failed after topology commit")?;
+            .context("roundtrip failed after topology commit");
+
+        // Tear down in reverse creation order: extensions first, then the
+        // objects they extend, then the topology.
+        for qs_cfg in created_qs_configs {
+            qs_cfg.destroy();
+        }
+        for qs_out in created_qs_outputs {
+            qs_out.destroy();
+        }
+        if let Some(qs_topology) = qs_topology {
+            qs_topology.destroy();
+        }
+        for cfg in created_configs {
+            cfg.destroy();
+        }
+        for dcs_out in created_outputs {
+            dcs_out.destroy();
+        }
+        wl_topology.destroy();
+
+        roundtrip?;
 
         if self.state.topology_error || self.state.config_error {
             anyhow::bail!(

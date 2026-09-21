@@ -65,6 +65,14 @@
       <arg name="id" type="new_id" interface="zwp_dcs_topology"
            summary="the new topology object"/>
     </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroys the manager object. Objects created through it, such as
+        zwp_dcs_output and zwp_dcs_topology, are not affected and remain
+        valid.
+      </description>
+    </request>
   </interface>
 
   <!-- ===================================================================
@@ -143,6 +151,14 @@
       <arg name="id" type="new_id" interface="zwp_dcs_display_configuration"
            summary="the new display configuration object"/>
     </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the DCS output object">
+        Destroys this object. The underlying wl_output and any
+        zwp_dcs_display_configuration objects created from this output are
+        not affected.
+      </description>
+    </request>
   </interface>
 
   <!-- ===================================================================
@@ -194,6 +210,17 @@
       <arg name="error" type="uint" enum="zwp_dcs_display_configuration.error"
            summary="the error that occurred"/>
     </event>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the display configuration">
+        Destroys this configuration and discards its pending state. If it
+        has been added to a topology, it is removed from that topology and
+        takes no part in later commits of it. Sub-protocol configuration
+        objects created for this configuration are not destroyed, but the
+        state staged on them can no longer be applied and the client should
+        destroy them as well.
+      </description>
+    </request>
   </interface>
 
   <!-- ===================================================================
@@ -246,6 +273,17 @@
       <arg name="error" type="uint" enum="zwp_dcs_topology.error"
            summary="the error that occurred"/>
     </event>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the topology">
+        Destroys this topology. Any uncommitted state is discarded. The
+        zwp_dcs_display_configuration objects added to it are not destroyed
+        and may be added to another topology. Sub-protocol topology objects
+        created from this topology are not destroyed, but since they can
+        only be applied through this topology's commit the client should
+        destroy them as well.
+      </description>
+    </request>
   </interface>
 
 </protocol>

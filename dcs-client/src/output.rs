@@ -75,17 +75,32 @@ impl DcsClient {
         // Request DCS output info for each wl_output.  User data = index so
         // the Dispatch<ZwpDcsOutput, usize> impl knows which slot to fill.
         let qs_manager = self.state.quadro_sync_manager.clone();
+        let mut dcs_outputs = Vec::with_capacity(wl_outputs.len());
+        let mut qs_outputs = Vec::new();
         for (i, wl_output) in wl_outputs.iter().enumerate() {
             let dcs_out = manager.get_output(wl_output, &self.qh, i);
             if let Some(qs) = &qs_manager {
-                qs.get_output(&dcs_out, &self.qh, i);
+                qs_outputs.push(qs.get_output(&dcs_out, &self.qh, i));
             }
+            dcs_outputs.push(dcs_out);
         }
 
         // Roundtrip: server sends mode/device/number/done for each output.
-        self.event_queue
+        let roundtrip = self
+            .event_queue
             .roundtrip(&mut self.state)
-            .context("roundtrip failed while enumerating outputs")?;
+            .context("roundtrip failed while enumerating outputs");
+
+        // The query objects have served their purpose once the events are
+        // in; the wl_output proxies are what `apply` needs later.
+        for qs_out in qs_outputs {
+            qs_out.destroy();
+        }
+        for dcs_out in dcs_outputs {
+            dcs_out.destroy();
+        }
+
+        roundtrip?;
 
         // Build BoundOutput list (internal) and OutputInfo list (public).
         let mut bound = Vec::new();

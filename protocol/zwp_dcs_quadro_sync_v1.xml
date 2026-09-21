@@ -51,6 +51,13 @@
       <arg name="id" type="new_id" interface="zwp_dcs_quadro_sync_topology"/>
       <arg name="topology" type="object" interface="zwp_dcs_topology"/>
     </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroys the manager object. Objects created through it are not
+        affected and remain valid.
+      </description>
+    </request>
   </interface>
 
   <interface name="zwp_dcs_quadro_sync_output" version="1">
@@ -95,6 +102,13 @@
       <arg name="id" type="new_id" interface="zwp_dcs_quadro_sync_display_configuration"/>
       <arg name="config" type="object" interface="zwp_dcs_display_configuration"/>
     </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the QuadroSync output object">
+        Destroys this object. The zwp_dcs_output it extends and any
+        configuration objects created from it are not affected.
+      </description>
+    </request>
   </interface>
 
   <interface name="zwp_dcs_quadro_sync_display_configuration" version="1">
@@ -108,6 +122,15 @@
       </description>
       <arg name="role" type="uint" enum="zwp_dcs_quadro_sync_output.role"
            summary="desired role"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the QuadroSync display configuration">
+        Destroys this object and discards its pending role. The
+        zwp_dcs_display_configuration it extends is not affected; a later
+        commit of that configuration leaves the display's QuadroSync role
+        unchanged.
+      </description>
     </request>
   </interface>
 
@@ -146,6 +169,14 @@
     <request name="set_sync_enable">
       <description summary="enable or disable sync"/>
       <arg name="enable" type="uint" summary="1 to enable, 0 to disable"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the QuadroSync topology">
+        Destroys this object and discards its pending settings. The
+        zwp_dcs_topology it extends is not affected; a later commit of that
+        topology leaves the board-level QuadroSync settings unchanged.
+      </description>
     </request>
   </interface>
 </protocol>
