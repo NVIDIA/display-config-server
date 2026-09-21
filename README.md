@@ -5,6 +5,12 @@ Direct-to-Display (D2D) applications on demand. This supports display walls and
 advanced workstation features on platforms which do not have X11-based features
 such as NVIDIA Mosaic.
 
+> **Warning:** This project is under active development and is not ready for
+> production use. The protocols, command line tools, and configuration format
+> are unstable and may change without notice, and driver support is still under
+> development. For now this project is only intended for experimental or
+> reference use.
+
 ## Background
 
 Historically, "display walls" made out of large numbers of displays deployed
