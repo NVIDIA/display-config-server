@@ -337,10 +337,14 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
             zwp_dcs_topology::Request::Commit => {
                 let mut topology = data.lock().unwrap();
                 topology.prune_dead();
-                if let Err((idx, e)) = state.apply_topology(&topology) {
-                    tracing::error!("topology commit failed: {:#}", e);
-                    topology.configurations[idx].error(ConfigError::InvalidState);
-                    resource.error(TopologyError::Failed);
+                // Every commit gets exactly one reply: done or error.
+                match state.apply_topology(&topology) {
+                    Ok(()) => resource.done(),
+                    Err((idx, e)) => {
+                        tracing::error!("topology commit failed: {:#}", e);
+                        topology.configurations[idx].error(ConfigError::InvalidState);
+                        resource.error(TopologyError::Failed);
+                    }
                 }
             }
             // Configurations added here are separate objects the client still

@@ -128,7 +128,8 @@ impl DcsClient {
             created_configs.push(cfg);
         }
 
-        // Reset error flags before commit.
+        // Reset the reply flags before commit.
+        self.state.topology_done = false;
         self.state.topology_error = false;
         self.state.config_error = false;
 
@@ -164,6 +165,13 @@ impl DcsClient {
             anyhow::bail!(
                 "topology commit rejected by DCS — verify display numbers and mode values"
             );
+        }
+
+        // The server replies to every commit with done or error, and the
+        // roundtrip above returns only after it has processed the commit,
+        // so a missing reply is a server bug rather than a slow server.
+        if !self.state.topology_done {
+            anyhow::bail!("DCS did not acknowledge the topology commit");
         }
 
         Ok(())

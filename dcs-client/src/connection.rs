@@ -73,6 +73,8 @@ pub(crate) struct ClientState {
     /// Fully resolved outputs; set at the end of `enumerate_outputs`.
     pub bound_outputs: Vec<BoundOutput>,
     /// Set to true if a topology commit error event is received.
+    /// Set by `zwp_dcs_topology.done`; the server applied the last commit.
+    pub topology_done: bool,
     pub topology_error: bool,
     /// Set to true if a display configuration error event is received.
     pub config_error: bool,
@@ -130,6 +132,7 @@ pub fn connect() -> anyhow::Result<DcsClient> {
         quadro_sync_manager: None,
         pending: Vec::new(),
         bound_outputs: Vec::new(),
+        topology_done: false,
         topology_error: false,
         config_error: false,
     };
@@ -272,6 +275,9 @@ impl Dispatch<ZwpDcsTopology, ()> for ClientState {
         _qh: &QueueHandle<Self>,
     ) {
         match event {
+            zwp_dcs_topology::Event::Done => {
+                state.topology_done = true;
+            }
             zwp_dcs_topology::Event::Error { .. } => {
                 state.topology_error = true;
             }

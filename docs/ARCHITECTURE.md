@@ -30,8 +30,6 @@ XML with `wayland-scanner` (`generate_server_code!` / `generate_client_code!`).
 - **`DcsState`** (`src/main.rs`) — the root compositor state passed to
   every Wayland dispatch handler.
   - `devices: Vec<DcsDevice>` — one per DRM device (GPU) DCS manages.
-  - `pending_commit: Option<attribute::PendingCommit>` — staging area for an
-    in-progress topology commit (see the attribute system below).
   - Helpers: `output_for_handle`/`output_for_handle_mut`/`device_for_handle` take an
     `OutputHandle` (device index + CRTC) and resolve it to the output or device;
     `validate_output_mode_change` and `commit_output_mode_change` forward to
@@ -382,14 +380,19 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
       `wl_topology.add_configuration(&cfg)`; and
       for a role, `qs_manager.get_output(&dcs_out)` →
       `.get_configuration(&cfg)` → `.set_role(role)`.
-   6. Reset the error flags, `wl_topology.commit()`, roundtrip, and fail if
-      `topology_error`/`config_error` was set by an `Error` event.
+   6. Reset the reply flags, `wl_topology.commit()`, roundtrip, then fail if
+      `topology_error`/`config_error` was set by an `error` event or if
+      `topology_done` was not set by the `done` event. Every commit gets
+      exactly one of `done` or `error` from the server.
    7. Destroy every object created above, extensions first, then the base
-      objects, then the topology. Every DCS protocol object has a `destroy`
-      destructor; the server tolerates a configuration or QuadroSync
-      extension being destroyed while a topology still references it by
-      pruning dead resources before each `add_configuration` and `commit`
-      (`WlDcsTopology::prune_dead`).
+      objects, then the topology. After `done` the protocol requires the
+      topology and its sub-protocol objects to be destroyed; after `error`
+      the topology stays alive so a client could adjust and recommit, but
+      `dcs-tool` reports the failure and tears down anyway. Every DCS
+      protocol object has a `destroy` destructor; the server tolerates a
+      configuration or QuadroSync extension being destroyed while a topology
+      still references it by pruning dead resources before each
+      `add_configuration` and `commit` (`WlDcsTopology::prune_dead`).
 
 **Server side:**
 
@@ -417,7 +420,8 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
    damage, so `render_frame` produces a frame and `queue_frame` performs
    the **atomic KMS commit that carries the modeset**. The VBlank event
    then delivers `frame_submitted`, completing the flip.
-11. `flush_clients` sends any error events; the client's roundtrip in step 6
+11. `flush_clients` sends the reply, `done` on success or the configuration
+    and topology `error` events on failure; the client's roundtrip in step 6
     returns and `dcs-tool` prints success or failure.
 
 ## Flow 2: a Vulkan ICD leasing and driving displays

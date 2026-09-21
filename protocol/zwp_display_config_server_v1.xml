@@ -279,13 +279,42 @@
 
     <request name="commit">
       <description summary="commit all configurations atomically">
-        Commits the changes to all configurations.
+        Commits the changes to all configurations. The server answers every
+        commit with exactly one of the done or error events, sent after any
+        zwp_dcs_display_configuration.error events that belong to the same
+        commit. Commits are processed in order, so a client that waits for
+        the reply before committing again can match each reply to its
+        request.
+
+        If the commit fails and error is sent, nothing was applied and the
+        topology stays alive with all of its pending state. The client can
+        adjust the offending configuration and commit again without
+        rebuilding the topology.
+
+        If the commit succeeds and done is sent, the commit is complete and
+        the topology's lifetime is over. The client must destroy it, along
+        with any sub-protocol topology objects created from it. The
+        configurations that were added to it have been applied and should
+        be destroyed as well. The only request permitted on these objects
+        after done is destroy.
       </description>
     </request>
 
+    <event name="done">
+      <description summary="topology commit succeeded">
+        Sent when every configuration in the committed topology was
+        validated and applied. The displays are now in the requested state
+        and the topology is finished, see commit for what the client must
+        do next.
+      </description>
+    </event>
+
     <event name="error">
       <description summary="topology commit error">
-        Error returned on this object if part of its configuration failed.
+        Sent when the commit was rejected. Nothing was applied and the
+        topology stays alive so the client can correct it and commit again.
+        The configuration objects that caused the rejection receive their
+        own error events before this one.
       </description>
       <arg name="error" type="uint" enum="zwp_dcs_topology.error"
            summary="the error that occurred"/>
@@ -293,7 +322,9 @@
 
     <request name="destroy" type="destructor">
       <description summary="destroy the topology">
-        Destroys this topology. Any uncommitted state is discarded. The
+        Destroys this topology. Any uncommitted state is discarded. This is
+        the required final request after a commit reports done, and may
+        also be sent at any other time to abandon the topology. The
         zwp_dcs_display_configuration objects added to it are not destroyed
         and may be added to another topology. Sub-protocol topology objects
         created from this topology are not destroyed, but since they can
