@@ -95,7 +95,19 @@ impl DcsClient {
             let cfg = dcs_out.create_configuration(&self.qh, ());
 
             if let Some(mode) = &display.mode {
-                cfg.set_mode(mode.width, mode.height, mode.refresh_mhz);
+                // The config names modes by geometry; the protocol wants the
+                // id the server advertised for that geometry on this display.
+                let advertised = bound
+                    .info
+                    .find_mode(mode.width, mode.height, mode.refresh_mhz)
+                    .with_context(|| {
+                        format!(
+                            "display {} does not support {}x{}@{}mHz — run `dcs-tool show` \
+                             to list its modes",
+                            display.number, mode.width, mode.height, mode.refresh_mhz
+                        )
+                    })?;
+                cfg.set_mode(advertised.id);
             }
 
             wl_topology.add_configuration(&cfg);

@@ -182,7 +182,7 @@ Core protocol (`src/protocol/zwp_display_config_server_v1.rs`):
 | User data | Attached to | Holds |
 |---|---|---|
 | `WlDcsOutput {handle}` | `zwp_dcs_output` | Which display (as an `OutputHandle`) this object refers to. |
-| `Mutex<WlDcsDisplayConfiguration>` | `zwp_dcs_display_configuration` | `handle` (OutputHandle), `pending_mode: (w, h, refresh_mhz)`, `pending_number`, and `quadro_sync_config: Option<ZwpDcsQuadroSyncDisplayConfiguration>` — the link that lets commit find the QuadroSync extension of this config. |
+| `Mutex<WlDcsDisplayConfiguration>` | `zwp_dcs_display_configuration` | `handle` (OutputHandle), `pending_mode: Option<u32>` (opaque mode id, resolved against `connector_modes` at commit), `pending_number`, and `quadro_sync_config: Option<ZwpDcsQuadroSyncDisplayConfiguration>` — the link that lets commit find the QuadroSync extension of this config. |
 | `Mutex<WlDcsTopology>` | `zwp_dcs_topology` | `configurations: Vec<ZwpDcsDisplayConfiguration>` and `quadro_sync_topology: Option<ZwpDcsQuadroSyncTopology>`. |
 
 Request handlers:
@@ -190,8 +190,11 @@ Request handlers:
 - `GetOutput` — resolves the `OutputHandle` from the `wl_output` argument's user
   data, then emits the output's info events: one `mode` event per
   **deduplicated** `(w, h, refresh)` (raw DRM mode lists can contain the
-  same visible mode twice — EDID detailed timing vs. CEA block), tagged
-  `current`/`preferred`/`none`, plus `device` (dev_t as a native-endian `wl_array`, like dmabuf `main_device`), `number`, `done`.
+  same visible mode twice — EDID detailed timing vs. CEA block), each with
+  an opaque mode id (internally the index into `connector_modes`, see
+  `mode_id`), then `current_mode` and `preferred_mode` naming ids from that
+  list, plus `device` (dev_t as a native-endian `wl_array`, like dmabuf
+  `main_device`), `number`, `done`.
 - `CreateTopology` (`:174`), `CreateConfiguration` (`:202`) — create the
   staging objects.
 - `SetMode`/`SetNumber` (`:221`) — record pending values in the config's
@@ -273,14 +276,15 @@ Everything a client needs to talk to DCS, in five modules:
   (`topology_error`, `config_error`) set by the `Error` event dispatchers.
   All protocol events land in `Dispatch` impls here; notably
   `Dispatch<ZwpDcsOutput, usize>` uses the user-data index to route
-  `mode`/`device`/`number`/`done` events into the right `pending` slot, and
+  `mode`/`current_mode`/`preferred_mode`/`device`/`number`/`done` events
+  into the right `pending` slot, and
   the same pattern (`Dispatch<ZwpDcsQuadroSyncOutput, usize>`) fills
   `qs_role`/`qs_sync_active`.
 - **`output.rs`** — public data model + enumeration:
   ```rust
-  pub struct ModeInfo { width, height, refresh_mhz, current, preferred }
+  pub struct ModeInfo { id, width, height, refresh_mhz }
   pub struct QuadroSyncOutputInfo { role: QuadroSyncRole, sync_active: bool }
-  pub struct OutputInfo { display_number, dev_t, modes: Vec<ModeInfo>,
+  pub struct OutputInfo { display_number, dev_t, modes: Vec<ModeInfo>, current_mode_id, preferred_mode_id,
                           quadro_sync: Option<QuadroSyncOutputInfo> }
   ```
   `DcsClient::enumerate_outputs()` calls `manager.get_output(wl_output)`
@@ -372,8 +376,10 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
       `set_polarity` / `set_house_sync_mode` / `set_sync_enable` for
       whichever board settings were given.
    5. Per display: `manager.get_output(&wl_output)` → `dcs_out`;
-      `dcs_out.create_configuration()` → `cfg`; `cfg.set_mode(w, h, mhz)`
-      if a mode was requested; `wl_topology.add_configuration(&cfg)`; and
+      `dcs_out.create_configuration()` → `cfg`; if a mode was requested,
+      `OutputInfo::find_mode(w, h, mhz)` maps the geometry from the config
+      to the id the server advertised and `cfg.set_mode(id)` stages it;
+      `wl_topology.add_configuration(&cfg)`; and
       for a role, `qs_manager.get_output(&dcs_out)` →
       `.get_configuration(&cfg)` → `.set_role(role)`.
    6. Reset the error flags, `wl_topology.commit()`, roundtrip, and fail if

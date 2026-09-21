@@ -37,7 +37,7 @@ use crate::render::dcs_output::OutputHandle;
 use crate::protocols::zwp_display_config_server_v1::{
     zwp_dcs_display_configuration::{self, Error as ConfigError, ZwpDcsDisplayConfiguration},
     zwp_dcs_manager::{self, ZwpDcsManager},
-    zwp_dcs_output::{self, Mode as OutputMode, ZwpDcsOutput},
+    zwp_dcs_output::{self, ZwpDcsOutput},
     zwp_dcs_topology::{self, Error as TopologyError, ZwpDcsTopology},
 };
 use crate::protocols::zwp_dcs_quadro_sync_v1::{
@@ -74,9 +74,10 @@ pub struct WlDcsDisplayConfiguration {
     /// Output inherited from the `WlDcsOutput` this configuration was created
     /// from. Identifies which display the pending changes apply to on `commit`.
     pub handle: Option<OutputHandle>,
-    /// Pending mode (width px, height px, refresh mHz) from `set_mode`.
-    /// `None` means the mode is not being changed in this commit.
-    pub pending_mode: Option<(u32, u32, u32)>,
+    /// Pending mode id from `set_mode`, as advertised by the `mode` event
+    /// (see [`mode_id`]). `None` means the mode is not being changed in
+    /// this commit.
+    pub pending_mode: Option<u32>,
     /// Pending display number from `set_number`.
     /// `None` means the display number is not being changed in this commit.
     pub pending_number: Option<u32>,
@@ -112,6 +113,17 @@ impl WlDcsTopology {
             self.quadro_sync_topology = None;
         }
     }
+}
+
+/// The opaque mode id advertised for `connector_modes[index]`.
+///
+/// Internally the id is just the index into the output's DRM mode list. The
+/// protocol keeps it opaque so the server is free to change this later, but
+/// the same scheme must be used by everything that mints or resolves ids:
+/// the `mode`/`current_mode`/`preferred_mode` events here and the `set_mode`
+/// resolution in [`DcsState::apply_topology`].
+fn mode_id(index: usize) -> u32 {
+    index as u32
 }
 
 impl GlobalDispatch<ZwpDcsManager, ()> for DcsState {
@@ -154,11 +166,14 @@ impl Dispatch<ZwpDcsManager, ()> for DcsState {
                         // Send one mode event per unique (width, height, refresh)
                         // combination.  DRM connector mode lists can contain
                         // duplicate entries (e.g. the same mode appearing in both
-                        // the EDID detailed timing block and the CEA section).
-                        //   current (1)   = the active mode
-                        //   preferred (2) = the first/native mode
-                        //   none (0)      = any other available mode
+                        // the EDID detailed timing block and the CEA section);
+                        // the first occurrence's index becomes the mode id.
+                        // The active mode is whichever advertised entry matches
+                        // the output's current mode, and the preferred mode is
+                        // the first-listed one, as with DRM.
                         let mut seen = std::collections::HashSet::new();
+                        let mut current_id = None;
+                        let mut preferred_id = None;
                         for (i, drm_mode) in dcs_out.connector_modes.iter().enumerate() {
                             let (w, h) = drm_mode.size();
                             let refresh_mhz = drm_mode.vrefresh() * 1000;
@@ -166,17 +181,25 @@ impl Dispatch<ZwpDcsManager, ()> for DcsState {
                             if !seen.insert(key) {
                                 continue;
                             }
-                            let is_current = w as u32 == dcs_out.mode_width
+                            let id = mode_id(i);
+                            resource.mode(id, w as u32, h as u32, refresh_mhz);
+
+                            if preferred_id.is_none() {
+                                preferred_id = Some(id);
+                            }
+                            if current_id.is_none()
+                                && w as u32 == dcs_out.mode_width
                                 && h as u32 == dcs_out.mode_height
-                                && refresh_mhz == dcs_out.mode_refresh_mhz;
-                            let flags = if is_current {
-                                OutputMode::Current
-                            } else if i == 0 {
-                                OutputMode::Preferred
-                            } else {
-                                OutputMode::None
-                            };
-                            resource.mode(flags, w as u32, h as u32, refresh_mhz);
+                                && refresh_mhz == dcs_out.mode_refresh_mhz
+                            {
+                                current_id = Some(id);
+                            }
+                        }
+                        if let Some(id) = current_id {
+                            resource.current_mode(id);
+                        }
+                        if let Some(id) = preferred_id {
+                            resource.preferred_mode(id);
                         }
                         // dev_t goes over the wire as sizeof(dev_t) native-endian
                         // bytes, matching wp_linux_dmabuf_feedback.main_device.
@@ -248,12 +271,10 @@ impl Dispatch<ZwpDcsDisplayConfiguration, Mutex<WlDcsDisplayConfiguration>> for 
     ) {
         let mut config = data.lock().unwrap();
         match request {
-            zwp_dcs_display_configuration::Request::SetMode {
-                width,
-                height,
-                refresh,
-            } => {
-                config.pending_mode = Some((width, height, refresh));
+            zwp_dcs_display_configuration::Request::SetMode { id } => {
+                // Resolved against the output's mode list at commit, so an
+                // unknown id is reported through the commit's error events.
+                config.pending_mode = Some(id);
             }
             zwp_dcs_display_configuration::Request::SetNumber { number } => {
                 config.pending_number = Some(number);
@@ -392,11 +413,23 @@ impl DcsState {
                 return Err((idx, anyhow!("configuration has no associated output")));
             };
 
-            if let Some((w, h, r)) = config.pending_mode {
+            if let Some(id) = config.pending_mode {
+                // Resolve the opaque id back to the DRM mode it was minted from.
+                let output = self
+                    .output_for_handle(handle)
+                    .ok_or_else(|| (idx, anyhow!("no output found for {:?}", handle)))?;
+                let drm_mode = output
+                    .connector_modes
+                    .iter()
+                    .enumerate()
+                    .find(|(i, _)| mode_id(*i) == id)
+                    .map(|(_, m)| m)
+                    .ok_or_else(|| (idx, anyhow!("unknown mode id {} for {:?}", id, handle)))?;
+                let (w, h) = drm_mode.size();
                 commit.display_attrs.push((handle, Box::new(ModeAttribute {
-                    width: w,
-                    height: h,
-                    refresh_mhz: r,
+                    width: w as u32,
+                    height: h as u32,
+                    refresh_mhz: drm_mode.vrefresh() * 1000,
                 })));
             }
 

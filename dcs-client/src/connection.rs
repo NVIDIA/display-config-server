@@ -37,6 +37,8 @@ pub(crate) struct PendingOutput {
     pub display_number: Option<i32>,
     pub dev_t: Option<u64>,
     pub modes: Vec<ModeInfo>,
+    pub current_mode_id: Option<u32>,
+    pub preferred_mode_id: Option<u32>,
     pub done: bool,
     /// QuadroSync role raw value (0=disabled, 1=server, 2=client), if reported.
     pub qs_role: Option<u32>,
@@ -219,16 +221,19 @@ impl Dispatch<ZwpDcsOutput, usize> for ClientState {
     ) {
         let Some(pending) = state.pending.get_mut(*index) else { return };
         match event {
-            zwp_dcs_output::Event::Mode { mode, width, height, refresh } => {
-                // mode enum: 0 = none, 1 = current (active), 2 = preferred (native).
-                let raw: u32 = mode.into();
+            zwp_dcs_output::Event::Mode { id, width, height, refresh } => {
                 pending.modes.push(ModeInfo {
+                    id,
                     width,
                     height,
                     refresh_mhz: refresh,
-                    current:   raw == 1,
-                    preferred: raw == 2,
                 });
+            }
+            zwp_dcs_output::Event::CurrentMode { id } => {
+                pending.current_mode_id = Some(id);
+            }
+            zwp_dcs_output::Event::PreferredMode { id } => {
+                pending.preferred_mode_id = Some(id);
             }
             zwp_dcs_output::Event::Device { device } => {
                 pending.dev_t = crate::output::dev_t_from_bytes(&device);

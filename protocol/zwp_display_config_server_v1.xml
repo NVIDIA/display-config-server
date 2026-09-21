@@ -100,27 +100,39 @@
       have been any changes.
     </description>
 
-    <enum name="mode">
-      <description summary="mode type"/>
-      <entry name="none" value="0"
-             summary="an available but non-active, non-preferred mode"/>
-      <entry name="current" value="1"
-             summary="this is the currently set mode for this display"/>
-      <entry name="preferred" value="2"
-             summary="this is the native (first-listed) mode and refresh rate"/>
-    </enum>
-
     <event name="mode">
       <description summary="sends a supported mode">
-        Sends a supported mode for this output. The mode flags indicate
-        whether this is the currently active mode or the preferred
-        (native) mode.
+        Sends one supported mode for this output. The id is an opaque value
+        chosen by the server that identifies this mode on this output for
+        the lifetime of the zwp_dcs_output. Clients pass it back to
+        zwp_dcs_display_configuration.set_mode and match it against
+        current_mode and preferred_mode. Ids carry no other meaning: they
+        need not be contiguous, ordered, or comparable across outputs.
+
+        All mode events for an output are sent before current_mode,
+        preferred_mode, and done.
       </description>
-      <arg name="mode" type="uint" enum="zwp_dcs_output.mode"
-           summary="mode flags"/>
+      <arg name="id" type="uint" summary="opaque mode id"/>
       <arg name="width" type="uint" summary="horizontal size in pixels"/>
       <arg name="height" type="uint" summary="vertical size in pixels"/>
       <arg name="refresh" type="uint" summary="vertical refresh rate in mHz"/>
+    </event>
+
+    <event name="current_mode">
+      <description summary="the currently active mode">
+        Identifies the mode currently set on this output, by the id given in
+        a previous mode event. Sent after the mode list; may be resent on
+        its own when the active mode changes.
+      </description>
+      <arg name="id" type="uint" summary="id of the active mode"/>
+    </event>
+
+    <event name="preferred_mode">
+      <description summary="the preferred (native) mode">
+        Identifies the display's preferred mode, by the id given in a
+        previous mode event. Sent after the mode list.
+      </description>
+      <arg name="id" type="uint" summary="id of the preferred mode"/>
     </event>
 
     <event name="device">
@@ -192,11 +204,13 @@
 
     <request name="set_mode">
       <description summary="record the requested mode">
-        Records the requested mode to set with this configuration update.
+        Records the mode to set with this configuration update, identified
+        by the id from a zwp_dcs_output.mode event of the output this
+        configuration was created from. An id that does not belong to that
+        output causes the topology commit to fail with an error event on
+        this configuration.
       </description>
-      <arg name="width" type="uint" summary="horizontal size in pixels"/>
-      <arg name="height" type="uint" summary="vertical size in pixels"/>
-      <arg name="refresh" type="uint" summary="vertical refresh rate in mHz"/>
+      <arg name="id" type="uint" summary="id of the mode to set"/>
     </request>
 
     <request name="set_number">

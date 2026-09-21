@@ -10,14 +10,13 @@ use crate::connection::{BoundOutput, DcsClient, PendingOutput};
 /// One display mode reported by the server.
 #[derive(Debug, Clone)]
 pub struct ModeInfo {
+    /// Opaque id the server uses for this mode on this output. Passed back
+    /// in `set_mode`; has no meaning beyond identity.
+    pub id: u32,
     pub width: u32,
     pub height: u32,
     /// Refresh rate in millihertz (e.g. 60000 for 60 Hz).
     pub refresh_mhz: u32,
-    /// True if this is the currently active mode.
-    pub current: bool,
-    /// True if this is the preferred (native) mode.
-    pub preferred: bool,
 }
 
 /// QuadroSync state of one display, as reported by the server.
@@ -41,6 +40,10 @@ pub struct OutputInfo {
     pub dev_t: u64,
     /// All modes reported by the server for this output.
     pub modes: Vec<ModeInfo>,
+    /// Id of the active mode (from `current_mode`), if the server sent one.
+    pub current_mode_id: Option<u32>,
+    /// Id of the preferred mode (from `preferred_mode`), if the server sent one.
+    pub preferred_mode_id: Option<u32>,
     /// QuadroSync state; `None` if QuadroSync hardware is not present.
     pub quadro_sync: Option<QuadroSyncOutputInfo>,
 }
@@ -48,7 +51,25 @@ pub struct OutputInfo {
 impl OutputInfo {
     /// Returns the currently active mode, if any.
     pub fn current_mode(&self) -> Option<&ModeInfo> {
-        self.modes.iter().find(|m| m.current)
+        self.mode_by_id(self.current_mode_id?)
+    }
+
+    /// Returns the preferred (native) mode, if any.
+    pub fn preferred_mode(&self) -> Option<&ModeInfo> {
+        self.mode_by_id(self.preferred_mode_id?)
+    }
+
+    /// Returns the advertised mode with this server-assigned id.
+    pub fn mode_by_id(&self, id: u32) -> Option<&ModeInfo> {
+        self.modes.iter().find(|m| m.id == id)
+    }
+
+    /// Returns the advertised mode matching a (width, height, refresh mHz)
+    /// triple, if this display supports it.
+    pub fn find_mode(&self, width: u32, height: u32, refresh_mhz: u32) -> Option<&ModeInfo> {
+        self.modes
+            .iter()
+            .find(|m| m.width == width && m.height == height && m.refresh_mhz == refresh_mhz)
     }
 }
 
@@ -134,6 +155,8 @@ impl DcsClient {
                 display_number: pending.display_number.unwrap_or(-1),
                 dev_t: pending.dev_t.unwrap_or(0),
                 modes: pending.modes.clone(),
+                current_mode_id: pending.current_mode_id,
+                preferred_mode_id: pending.preferred_mode_id,
                 quadro_sync: pending.qs_role.map(|raw| QuadroSyncOutputInfo {
                     // role enum: 0 = disabled, 1 = server, 2 = client.
                     role: match raw {

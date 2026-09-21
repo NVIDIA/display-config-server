@@ -148,8 +148,10 @@ fn cmd_show() -> anyhow::Result<()> {
                 println!("  (no modes)");
             } else {
                 for mode in &output.modes {
-                    let marker = if mode.current { "  * " } else { "    " };
-                    let tag = match (mode.current, mode.preferred) {
+                    let current = output.current_mode_id == Some(mode.id);
+                    let preferred = output.preferred_mode_id == Some(mode.id);
+                    let marker = if current { "  * " } else { "    " };
+                    let tag = match (current, preferred) {
                         (true, _) => " [current]",
                         (false, true) => " [preferred]",
                         _ => "",
