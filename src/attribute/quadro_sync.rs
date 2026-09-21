@@ -421,8 +421,39 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
     }
 
     fn validate(&self, state: &DcsState) -> anyhow::Result<()> {
+        use std::os::unix::io::{AsFd, AsRawFd};
+
         let mut servers = 0u32;
         let mut clients = 0u32;
+
+        // A commit touches only the displays it names, so a server already
+        // configured on any other QuadroSync-capable display stays in place
+        // and counts against the one-server limit. Clients are not counted
+        // here: the "at least one role" check below is about what this
+        // commit will actually enable, and that is only the displays named.
+        let named: Vec<OutputHandle> = self.roles.iter().map(|(h, _)| *h).collect();
+        for (device_index, device) in state.devices.iter().enumerate() {
+            if state.board_for_device(device_index).is_none() {
+                continue;
+            }
+            let fd = device.drm_device.as_fd().as_raw_fd();
+            for (crtc, output) in &device.outputs {
+                let handle = OutputHandle { device_index, crtc: *crtc };
+                if named.contains(&handle) {
+                    continue;
+                }
+                let connector_id: u32 = output.connector_handle.into();
+                match get_display_config(fd, connector_id) {
+                    Ok(QuadroSyncRole::Server) => servers += 1,
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!(
+                        "framelock display config query failed for connector {}: {}",
+                        connector_id,
+                        e
+                    ),
+                }
+            }
+        }
 
         for (handle, role_attr) in &self.roles {
             let output = state

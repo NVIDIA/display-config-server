@@ -64,6 +64,12 @@
     <description summary="QuadroSync output state">
       Extends zwp_dcs_output with QuadroSync state.  Events are sent
       before zwp_dcs_output.done.
+
+      This object follows the zwp_dcs_output it extends: when that output's
+      wl_output global is removed the server sends no further events here
+      and the client should destroy this object as well. A role staged for
+      a removed display on a zwp_dcs_quadro_sync_topology is reported at
+      commit as unknown_output.
     </description>
 
     <enum name="role">
@@ -95,49 +101,60 @@
       <description summary="all QuadroSync output state sent"/>
     </event>
 
-    <request name="get_configuration">
-      <description summary="create QuadroSync configuration for this output">
-        Creates a QuadroSync display configuration extending the base config.
-      </description>
-      <arg name="id" type="new_id" interface="zwp_dcs_quadro_sync_display_configuration"/>
-      <arg name="config" type="object" interface="zwp_dcs_display_configuration"/>
-    </request>
-
     <request name="destroy" type="destructor">
       <description summary="destroy the QuadroSync output object">
-        Destroys this object. The zwp_dcs_output it extends and any
-        configuration objects created from it are not affected.
-      </description>
-    </request>
-  </interface>
-
-  <interface name="zwp_dcs_quadro_sync_display_configuration" version="1">
-    <description summary="per-output QuadroSync settings">
-      Per-output QuadroSync configuration, extending zwp_dcs_display_configuration.
-    </description>
-
-    <request name="set_role">
-      <description summary="set the QuadroSync role for this output">
-        Set this output as framelock server, client, or disabled.
-      </description>
-      <arg name="role" type="uint" enum="zwp_dcs_quadro_sync_output.role"
-           summary="desired role"/>
-    </request>
-
-    <request name="destroy" type="destructor">
-      <description summary="destroy the QuadroSync display configuration">
-        Destroys this object and discards its pending role. The
-        zwp_dcs_display_configuration it extends is not affected; a later
-        commit of that configuration leaves the display's QuadroSync role
-        unchanged.
+        Destroys this object. The zwp_dcs_output it extends is not affected.
       </description>
     </request>
   </interface>
 
   <interface name="zwp_dcs_quadro_sync_topology" version="1">
-    <description summary="cross-output QuadroSync board settings">
-      Board-level QuadroSync settings, extending zwp_dcs_topology.
+    <description summary="QuadroSync settings for a topology">
+      Extends zwp_dcs_topology with QuadroSync state: per-display framelock
+      roles and board-level settings. Everything staged here is applied by
+      the base topology's commit. Setting a role twice for one output
+      replaces the earlier value.
+
+      Framelock state follows the same rule as the base topology: a commit
+      touches only the displays it names. A display's role persists until
+      a later commit names that display with a different role, and a
+      display that is not named keeps both its role and its current sync
+      state. There is one framelock group per system; it is the set of
+      displays whose role is server or client, across every commit made
+      so far.
+
+      set_sync_enable applies to the displays named in the same commit.
+      Enabling turns sync on for those displays (the server first), and
+      disabling turns it off for them, while unnamed members of the group
+      are left as they were. To engage or release the whole group, name
+      every member. A commit that enables sync must name at least one
+      display with a server or client role.
+
+      Role validation counts servers across the whole system: the roles
+      staged in this commit plus the roles already configured on displays
+      it does not name. A commit that would leave more than one server on
+      this system is rejected with a null-output failed error, so building
+      a group up over several commits cannot produce two servers.
+
+      Board-level settings (sync delay, polarity, house sync mode) are
+      properties of the sync source. They are applied to the board of the
+      display given the server role in the same commit. When the commit
+      names no server, for example on a client-only system whose server is
+      on another machine, they are ignored.
     </description>
+
+    <enum name="error">
+      <description summary="zwp_dcs_quadro_sync_topology error codes">
+        Codes sent with the error event. failed is only ever sent with a
+        null output; the others name the problem with one display.
+      </description>
+      <entry name="failed" value="0"
+             summary="the QuadroSync part of the commit was rejected as a whole"/>
+      <entry name="unknown_output" value="1"
+             summary="the wl_output is not a display managed by DCS"/>
+      <entry name="invalid_role" value="2"
+             summary="the role is not a valid zwp_dcs_quadro_sync_output.role value"/>
+    </enum>
 
     <enum name="polarity">
       <entry name="rising_edge" value="1" summary="sync on rising edge"/>
@@ -150,6 +167,17 @@
       <entry name="input" value="1" summary="house sync as input"/>
       <entry name="output" value="2" summary="house sync as output"/>
     </enum>
+
+    <request name="set_role">
+      <description summary="stage the QuadroSync role for a display">
+        Stages the framelock role for the given display: server, client, or
+        disabled.
+      </description>
+      <arg name="output" type="object" interface="wl_output"
+           summary="the display to change"/>
+      <arg name="role" type="uint" enum="zwp_dcs_quadro_sync_output.role"
+           summary="desired role"/>
+    </request>
 
     <request name="set_sync_delay">
       <description summary="set sync delay"/>
@@ -171,11 +199,26 @@
       <arg name="enable" type="uint" summary="1 to enable, 0 to disable"/>
     </request>
 
+    <event name="error">
+      <description summary="QuadroSync commit error">
+        Reports a QuadroSync problem with the base topology's commit. With a
+        non-null output it names one display and the reason its staged role
+        was rejected. With a null output and the failed code it reports that
+        the QuadroSync settings as a whole were rejected, for example
+        because the role assignments cannot form a valid framelock chain.
+        These events are sent before the base zwp_dcs_topology's
+        terminating error event; this object never sends done.
+      </description>
+      <arg name="output" type="object" interface="wl_output" allow-null="true"
+           summary="the display at fault, or null for the whole QuadroSync configuration"/>
+      <arg name="error" type="uint" enum="error" summary="the error that occurred"/>
+    </event>
+
     <request name="destroy" type="destructor">
       <description summary="destroy the QuadroSync topology">
         Destroys this object and discards its pending settings. The
         zwp_dcs_topology it extends is not affected; a later commit of that
-        topology leaves the board-level QuadroSync settings unchanged.
+        topology leaves the QuadroSync roles and board settings unchanged.
       </description>
     </request>
   </interface>

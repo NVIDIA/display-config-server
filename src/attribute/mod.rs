@@ -19,7 +19,7 @@ use crate::DcsState;
 
 /// A per-output attribute that configures one display.
 ///
-/// Created from protocol display_configuration requests.
+/// Created from the per-display requests on a protocol topology object.
 /// May be standalone (e.g., mode change) or owned by a [`TopologyAttribute`]
 /// (e.g., QuadroSync role assignment).
 pub trait DisplayAttribute: Send + Sync {

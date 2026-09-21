@@ -3,22 +3,26 @@
 //! Topology apply for DCS clients.
 
 use anyhow::Context;
+use wayland_client::WEnum;
+use wayland_client::protocol::wl_output::WlOutput;
 
-use crate::connection::DcsClient;
+use crate::connection::{BoundOutput, DcsClient};
 use crate::config::{HouseSyncMode, QuadroSyncPolarity, QuadroSyncRole, TopologyConfig};
 use crate::protocol::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_output::Role as ProtoRole;
 use crate::protocol::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_topology::{
-    HouseSyncMode as ProtoHouseSyncMode, Polarity as ProtoPolarity,
+    Error as QuadroSyncError, HouseSyncMode as ProtoHouseSyncMode, Polarity as ProtoPolarity,
 };
+use crate::protocol::zwp_display_config_server_v1::zwp_dcs_topology::Error as TopologyError;
 
 impl DcsClient {
     /// Apply a topology to DCS atomically.
     ///
     /// For each display in `topology.display`, finds the matching `wl_output`
     /// by display number (from a previous [`enumerate_outputs`] call or an
-    /// implicit one performed here), creates a `zwp_dcs_display_configuration`,
-    /// sets the requested mode, and adds it to a `zwp_dcs_topology`.  Commits
-    /// the topology and waits for success or an error event.
+    /// implicit one performed here), stages its mode and QuadroSync role on
+    /// a `zwp_dcs_topology` (and its QuadroSync extension), then commits and
+    /// waits for the reply. On failure the error names every display the
+    /// server rejected.
     pub fn apply(&mut self, topology: &TopologyConfig) -> anyhow::Result<()> {
         // Ensure we have bound_outputs for display-number lookup.
         if self.state.bound_outputs.is_empty() {
@@ -71,13 +75,8 @@ impl DcsClient {
             }
         }
 
-        // Every protocol object created below is destroyed once the commit
-        // result is in, so a long-lived client does not leak server objects.
-        let mut created_outputs = Vec::new();
-        let mut created_configs = Vec::new();
-        let mut created_qs_outputs = Vec::new();
-        let mut created_qs_configs = Vec::new();
-
+        // Every per-display request names the wl_output directly; there are
+        // no per-display protocol objects to create or tear down.
         for display in &topology.display {
             let bound = bound_outputs
                 .iter()
@@ -88,11 +87,6 @@ impl DcsClient {
                         display.number
                     )
                 })?;
-
-            // get_output with () user data: events are ignored (we already
-            // have info from enumerate_outputs).
-            let dcs_out = manager.get_output(&bound.wl_output, &self.qh, ());
-            let cfg = dcs_out.create_configuration(&self.qh, ());
 
             if let Some(mode) = &display.mode {
                 // The config names modes by geometry; the protocol wants the
@@ -107,31 +101,25 @@ impl DcsClient {
                             display.number, mode.width, mode.height, mode.refresh_mhz
                         )
                     })?;
-                cfg.set_mode(advertised.id);
+                wl_topology.set_mode(&bound.wl_output, advertised.id);
             }
 
-            wl_topology.add_configuration(&cfg);
-
-            if let (Some(role), Some(qs_manager)) = (display.quadro_sync_role, &qs_manager) {
-                let qs_out = qs_manager.get_output(&dcs_out, &self.qh, ());
-                let qs_cfg = qs_out.get_configuration(&cfg, &self.qh, ());
-                qs_cfg.set_role(match role {
-                    QuadroSyncRole::Disabled => ProtoRole::Disabled,
-                    QuadroSyncRole::Server => ProtoRole::Server,
-                    QuadroSyncRole::Client => ProtoRole::Client,
-                });
-                created_qs_outputs.push(qs_out);
-                created_qs_configs.push(qs_cfg);
+            if let (Some(role), Some(qs_topology)) = (display.quadro_sync_role, &qs_topology) {
+                qs_topology.set_role(
+                    &bound.wl_output,
+                    match role {
+                        QuadroSyncRole::Disabled => ProtoRole::Disabled,
+                        QuadroSyncRole::Server => ProtoRole::Server,
+                        QuadroSyncRole::Client => ProtoRole::Client,
+                    },
+                );
             }
-
-            created_outputs.push(dcs_out);
-            created_configs.push(cfg);
         }
 
-        // Reset the reply flags before commit.
+        // Reset the reply state before commit.
         self.state.topology_done = false;
-        self.state.topology_error = false;
-        self.state.config_error = false;
+        self.state.topology_errors.clear();
+        self.state.quadro_sync_errors.clear();
 
         wl_topology.commit();
 
@@ -140,30 +128,24 @@ impl DcsClient {
             .roundtrip(&mut self.state)
             .context("roundtrip failed after topology commit");
 
-        // Tear down in reverse creation order: extensions first, then the
-        // objects they extend, then the topology.
-        for qs_cfg in created_qs_configs {
-            qs_cfg.destroy();
-        }
-        for qs_out in created_qs_outputs {
-            qs_out.destroy();
-        }
+        // The protocol requires the topology (and its extension) to be
+        // destroyed after done; on error the tool has nothing to retry with,
+        // so it tears down in that case too.
         if let Some(qs_topology) = qs_topology {
             qs_topology.destroy();
-        }
-        for cfg in created_configs {
-            cfg.destroy();
-        }
-        for dcs_out in created_outputs {
-            dcs_out.destroy();
         }
         wl_topology.destroy();
 
         roundtrip?;
 
-        if self.state.topology_error || self.state.config_error {
+        if !self.state.topology_errors.is_empty() || !self.state.quadro_sync_errors.is_empty() {
             anyhow::bail!(
-                "topology commit rejected by DCS — verify display numbers and mode values"
+                "topology commit rejected by DCS:{}",
+                describe_failures(
+                    &bound_outputs,
+                    &self.state.topology_errors,
+                    &self.state.quadro_sync_errors,
+                )
             );
         }
 
@@ -175,5 +157,72 @@ impl DcsClient {
         }
 
         Ok(())
+    }
+}
+
+/// One line per display-specific error, with the display named by its DCS
+/// number. The terminating topology-wide `failed` carries no extra
+/// information when display lines exist, so it is only mentioned when it is
+/// all the server sent.
+fn describe_failures(
+    bound_outputs: &[BoundOutput],
+    topology_errors: &[(Option<WlOutput>, WEnum<TopologyError>)],
+    quadro_sync_errors: &[(Option<WlOutput>, WEnum<QuadroSyncError>)],
+) -> String {
+    let display_name = |output: &WlOutput| -> String {
+        bound_outputs
+            .iter()
+            .find(|b| b.wl_output == *output)
+            .map(|b| format!("display {}", b.info.display_number))
+            .unwrap_or_else(|| String::from("unknown display"))
+    };
+
+    let mut lines = Vec::new();
+
+    for (output, error) in topology_errors {
+        let reason = match error {
+            WEnum::Value(TopologyError::UnknownOutput) => "not a display managed by DCS",
+            WEnum::Value(TopologyError::InvalidMode) => {
+                "the requested mode is not advertised by this display"
+            }
+            WEnum::Value(TopologyError::InvalidState) => {
+                "the requested state could not be validated or applied"
+            }
+            WEnum::Value(TopologyError::Failed) => "the commit was rejected",
+            WEnum::Unknown(code) => {
+                lines.push(format!("\n  unknown topology error code {}", code));
+                continue;
+            }
+        };
+        match output {
+            Some(output) => lines.push(format!("\n  {}: {}", display_name(output), reason)),
+            None => {}
+        }
+    }
+
+    for (output, error) in quadro_sync_errors {
+        let reason = match error {
+            WEnum::Value(QuadroSyncError::UnknownOutput) => "not a display managed by DCS",
+            WEnum::Value(QuadroSyncError::InvalidRole) => "invalid QuadroSync role",
+            WEnum::Value(QuadroSyncError::Failed) => {
+                "QuadroSync settings rejected as a whole (check server/client roles and sync)"
+            }
+            WEnum::Unknown(code) => {
+                lines.push(format!("\n  unknown QuadroSync error code {}", code));
+                continue;
+            }
+        };
+        match output {
+            Some(output) => {
+                lines.push(format!("\n  {} (QuadroSync): {}", display_name(output), reason))
+            }
+            None => lines.push(format!("\n  QuadroSync: {}", reason)),
+        }
+    }
+
+    if lines.is_empty() {
+        String::from(" no display-specific detail was reported")
+    } else {
+        lines.concat()
     }
 }

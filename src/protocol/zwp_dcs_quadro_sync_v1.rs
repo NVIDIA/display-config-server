@@ -13,18 +13,16 @@ use crate::attribute::quadro_sync::{
     QuadroSyncTopologyAttribute,
 };
 use crate::protocols::zwp_dcs_quadro_sync_v1::{
-    zwp_dcs_quadro_sync_display_configuration::{
-        self, ZwpDcsQuadroSyncDisplayConfiguration,
-    },
     zwp_dcs_quadro_sync_manager::{self, ZwpDcsQuadroSyncManager},
     zwp_dcs_quadro_sync_output::{self, Role as OutputRole, ZwpDcsQuadroSyncOutput},
     zwp_dcs_quadro_sync_topology::{
-        self, HouseSyncMode as ProtoHouseSyncMode, Polarity as ProtoPolarity,
-        ZwpDcsQuadroSyncTopology,
+        self, Error as QuadroSyncError, HouseSyncMode as ProtoHouseSyncMode,
+        Polarity as ProtoPolarity, ZwpDcsQuadroSyncTopology,
     },
 };
+use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::WEnum;
-use crate::protocol::zwp_display_config_server_v1::{WlDcsDisplayConfiguration, WlDcsOutput};
+use crate::protocol::zwp_display_config_server_v1::{CommitFailure, WlDcsOutput};
 use crate::DcsState;
 
 // ---------------------------------------------------------------------------
@@ -32,23 +30,28 @@ use crate::DcsState;
 // ---------------------------------------------------------------------------
 
 /// User data for a `zwp_dcs_quadro_sync_output` resource.
-pub struct WlQuadroSyncOutput {
-    /// Output of the base DCS output this extends.
-    pub handle: Option<OutputHandle>,
-}
+///
+/// The object is read-only for the client (its state arrives as events at
+/// creation), so nothing needs to be remembered per resource.
+pub struct WlQuadroSyncOutput;
 
-/// User data for a `zwp_dcs_quadro_sync_display_configuration` resource.
-pub struct WlQuadroSyncDisplayConfiguration {
-    /// Inherited from the base DCS output.
+/// A framelock role staged for one display by `set_role`.
+pub struct PendingRole {
+    /// The `wl_output` the client named. Kept so commit errors can point at it.
+    pub output: WlOutput,
+    /// Resolved from the `wl_output`'s user data; `None` means DCS does not
+    /// manage that output, reported as `unknown_output` at commit.
     pub handle: Option<OutputHandle>,
-    /// Raw DRM connector id, resolved from the base DCS output at bind time.
-    pub connector_id: Option<u32>,
-    /// Role staged by `set_role`.
-    pub pending_role: Option<QuadroSyncRole>,
+    /// `None` when the client sent a value outside the role enum, reported
+    /// as `invalid_role` at commit.
+    pub role: Option<QuadroSyncRole>,
 }
 
 /// User data for a `zwp_dcs_quadro_sync_topology` resource.
 pub struct WlQuadroSyncTopology {
+    /// Roles staged by `set_role`, in the order the client first named each
+    /// display.
+    pub roles: Vec<PendingRole>,
     pub pending_sync_delay: Option<u32>,
     pub pending_polarity: Option<QuadroSyncPolarity>,
     pub pending_house_sync_mode: Option<HouseSyncMode>,
@@ -87,7 +90,7 @@ impl Dispatch<ZwpDcsQuadroSyncManager, ()> for DcsState {
                 // Look up the OutputHandle from the base DCS output's user data.
                 let handle = output.data::<WlDcsOutput>().and_then(|d| d.handle);
 
-                let resource = data_init.init(id, WlQuadroSyncOutput { handle });
+                let resource = data_init.init(id, WlQuadroSyncOutput);
 
                 // Send the current QuadroSync state for this output, queried
                 // from the hardware.
@@ -109,6 +112,7 @@ impl Dispatch<ZwpDcsQuadroSyncManager, ()> for DcsState {
                 let qs_topo = data_init.init(
                     id,
                     Mutex::new(WlQuadroSyncTopology {
+                        roles: Vec::new(),
                         pending_sync_delay: None,
                         pending_polarity: None,
                         pending_house_sync_mode: None,
@@ -190,73 +194,12 @@ impl Dispatch<ZwpDcsQuadroSyncOutput, WlQuadroSyncOutput> for DcsState {
         _client: &Client,
         _resource: &ZwpDcsQuadroSyncOutput,
         request: zwp_dcs_quadro_sync_output::Request,
-        data: &WlQuadroSyncOutput,
-        _handle: &DisplayHandle,
-        data_init: &mut DataInit<'_, Self>,
-    ) {
-        match request {
-            zwp_dcs_quadro_sync_output::Request::GetConfiguration { id, config } => {
-                let handle = data.handle;
-
-                // connector_id is resolved during commit via the output handle;
-                // nothing to look up here without DcsState access.
-                let qs_config = data_init.init(
-                    id,
-                    Mutex::new(WlQuadroSyncDisplayConfiguration {
-                        handle,
-                        connector_id: None,
-                        pending_role: None,
-                    }),
-                );
-
-                // Stash this QuadroSync configuration in the base display
-                // configuration's user data so the base topology's commit
-                // handler can collect it via the registered configurations.
-                if let Some(base_data) = config.data::<Mutex<WlDcsDisplayConfiguration>>() {
-                    base_data.lock().unwrap().quadro_sync_config = Some(qs_config);
-                } else {
-                    tracing::warn!(
-                        "get_configuration: base display configuration has no user data; \
-                         staged QuadroSync role will be ignored at commit"
-                    );
-                }
-            }
-            zwp_dcs_quadro_sync_output::Request::Destroy => {}
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Display Configuration: Dispatch
-// ---------------------------------------------------------------------------
-
-impl Dispatch<ZwpDcsQuadroSyncDisplayConfiguration, Mutex<WlQuadroSyncDisplayConfiguration>>
-    for DcsState
-{
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &ZwpDcsQuadroSyncDisplayConfiguration,
-        request: zwp_dcs_quadro_sync_display_configuration::Request,
-        data: &Mutex<WlQuadroSyncDisplayConfiguration>,
+        _data: &WlQuadroSyncOutput,
         _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        let mut config = data.lock().unwrap();
         match request {
-            zwp_dcs_quadro_sync_display_configuration::Request::SetRole { role } => {
-                // role is WEnum<zwp_dcs_quadro_sync_output::Role>; extract numeric value.
-                use crate::protocols::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_output::Role as ProtoRole;
-                config.pending_role = match role {
-                    WEnum::Value(ProtoRole::Disabled) => Some(QuadroSyncRole::Disabled),
-                    WEnum::Value(ProtoRole::Server) => Some(QuadroSyncRole::Server),
-                    WEnum::Value(ProtoRole::Client) => Some(QuadroSyncRole::Client),
-                    _ => None,
-                };
-            }
-            // The base configuration checks `is_alive()` at commit and skips a
-            // destroyed extension, so the role is left unchanged.
-            zwp_dcs_quadro_sync_display_configuration::Request::Destroy => {}
+            zwp_dcs_quadro_sync_output::Request::Destroy => {}
         }
     }
 }
@@ -277,6 +220,24 @@ impl Dispatch<ZwpDcsQuadroSyncTopology, Mutex<WlQuadroSyncTopology>> for DcsStat
     ) {
         let mut topo = data.lock().unwrap();
         match request {
+            zwp_dcs_quadro_sync_topology::Request::SetRole { output, role } => {
+                let role = match role {
+                    WEnum::Value(OutputRole::Disabled) => Some(QuadroSyncRole::Disabled),
+                    WEnum::Value(OutputRole::Server) => Some(QuadroSyncRole::Server),
+                    WEnum::Value(OutputRole::Client) => Some(QuadroSyncRole::Client),
+                    _ => None,
+                };
+                // One entry per display; a repeated set_role replaces it.
+                if let Some(existing) = topo.roles.iter_mut().find(|r| r.output == output) {
+                    existing.role = role;
+                } else {
+                    topo.roles.push(PendingRole {
+                        handle: output.data::<OutputHandle>().copied(),
+                        output,
+                        role,
+                    });
+                }
+            }
             zwp_dcs_quadro_sync_topology::Request::SetSyncDelay { delay } => {
                 topo.pending_sync_delay = Some(delay);
             }
@@ -318,65 +279,72 @@ impl Dispatch<ZwpDcsQuadroSyncTopology, Mutex<WlQuadroSyncTopology>> for DcsStat
 // ---------------------------------------------------------------------------
 
 impl DcsState {
-    /// Build a [`QuadroSyncTopologyAttribute`] from the QuadroSync topology
-    /// resource associated with the given base topology.
+    /// Build a [`QuadroSyncTopologyAttribute`] from the state staged on a
+    /// QuadroSync topology extension.
     ///
-    /// `qs_configs` are the QuadroSync display configurations collected from
-    /// the base topology's registered configurations at commit time (each base
-    /// configuration extended via `get_configuration` carries its QuadroSync
-    /// companion in its user data).
+    /// Returns `Ok(None)` when nothing QuadroSync-related was staged, so a
+    /// topology that merely created the extension does not touch framelock.
+    /// Per-display problems (an output DCS does not manage, an out-of-range
+    /// role) come back as [`CommitFailure`]s so the commit reply can name
+    /// each display; role-count and board validation happen later in the
+    /// attribute's own `validate`.
     ///
     /// Called by the base topology's `Commit` handler, which owns the
     /// [`PendingCommit`](crate::attribute::PendingCommit) the result goes into.
     pub fn build_quadro_sync_attribute(
         &self,
         qs_topo_resource: &ZwpDcsQuadroSyncTopology,
-        qs_configs: &[ZwpDcsQuadroSyncDisplayConfiguration],
-    ) -> anyhow::Result<QuadroSyncTopologyAttribute> {
+    ) -> Result<Option<QuadroSyncTopologyAttribute>, Vec<CommitFailure>> {
         let topo = qs_topo_resource
             .data::<Mutex<WlQuadroSyncTopology>>()
-            .ok_or_else(|| anyhow::anyhow!("QuadroSync topology has no user data"))?
+            .expect("wrong user data type on zwp_dcs_quadro_sync_topology")
             .lock()
             .unwrap();
 
         let mut roles = Vec::new();
+        let mut failures = Vec::new();
 
-        for qs_config_resource in qs_configs {
-            let qs_config = qs_config_resource
-                .data::<Mutex<WlQuadroSyncDisplayConfiguration>>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("QuadroSync display config has no user data")
-                })?
-                .lock()
-                .unwrap();
-
-            let Some(handle) = qs_config.handle else {
+        for pending in topo.roles.iter().filter(|r| r.output.is_alive()) {
+            let output = pending
+                .handle
+                .and_then(|handle| self.output_for_handle(handle).map(|o| (handle, o)));
+            let Some((handle, dcs_output)) = output else {
+                failures.push(CommitFailure::QuadroSyncDisplay {
+                    output: pending.output.clone(),
+                    error: QuadroSyncError::UnknownOutput,
+                });
                 continue;
             };
-
-            let role = qs_config
-                .pending_role
-                .unwrap_or(QuadroSyncRole::Disabled);
-
-            // Resolve the connector_id from the DcsOutput for this handle.
-            let connector_id = self
-                .output_for_handle(handle)
-                .map(|o| {
-                    let raw: u32 = o.connector_handle.into();
-                    raw
-                })
-                .unwrap_or(0);
-
+            let Some(role) = pending.role else {
+                failures.push(CommitFailure::QuadroSyncDisplay {
+                    output: pending.output.clone(),
+                    error: QuadroSyncError::InvalidRole,
+                });
+                continue;
+            };
+            let connector_id: u32 = dcs_output.connector_handle.into();
             roles.push((handle, QuadroSyncRoleAttribute { connector_id, role }));
         }
 
-        Ok(QuadroSyncTopologyAttribute {
+        if !failures.is_empty() {
+            return Err(failures);
+        }
+
+        let has_board_settings = topo.pending_sync_delay.is_some()
+            || topo.pending_polarity.is_some()
+            || topo.pending_house_sync_mode.is_some()
+            || topo.pending_sync_enable.is_some();
+        if roles.is_empty() && !has_board_settings {
+            return Ok(None);
+        }
+
+        Ok(Some(QuadroSyncTopologyAttribute {
             roles,
             sync_delay: topo.pending_sync_delay,
             polarity: topo.pending_polarity,
             house_sync_mode: topo.pending_house_sync_mode,
             sync_enable: topo.pending_sync_enable.unwrap_or(false),
             framelock_index: 0,
-        })
+        }))
     }
 }

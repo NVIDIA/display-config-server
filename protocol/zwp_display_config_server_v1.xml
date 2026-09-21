@@ -98,6 +98,25 @@
       Note that the events here will be resent on any changes. Unlike
       wl_output's values which are sent once, these may be resent if there
       have been any changes.
+
+      Display connection and removal are reported through wl_registry: a
+      newly connected display appears as a new wl_output global, and a
+      display that is unplugged has its wl_output global removed with
+      wl_registry.global_remove. A zwp_dcs_output follows the wl_output it
+      extends. Once that global has been removed the server sends no
+      further events on the zwp_dcs_output, and the client should destroy
+      it along with the wl_output. Mode ids learned from it are no longer
+      valid. A display that is plugged back in is a new wl_output global
+      with a new zwp_dcs_output and freshly assigned mode ids; there is no
+      identity carried across the unplug.
+
+      Because removal is asynchronous, a client may send a request naming
+      a wl_output whose global has already been removed on the server.
+      Such a request is not a protocol error. The server treats the output
+      as one it does not manage: for a zwp_dcs_topology this surfaces at
+      commit as an unknown_output error for that display, and the commit
+      fails as a whole so the client can re-enumerate and decide what to do
+      with the remaining displays.
     </description>
 
     <event name="mode">
@@ -105,7 +124,7 @@
         Sends one supported mode for this output. The id is an opaque value
         chosen by the server that identifies this mode on this output for
         the lifetime of the zwp_dcs_output. Clients pass it back to
-        zwp_dcs_display_configuration.set_mode and match it against
+        zwp_dcs_topology.set_mode and match it against
         current_mode and preferred_mode. Ids carry no other meaning: they
         need not be contiguous, ordered, or comparable across outputs.
 
@@ -159,83 +178,11 @@
       </description>
     </event>
 
-    <request name="create_configuration">
-      <description summary="create a display configuration object">
-        Create a new zwp_dcs_display_configuration object for this output.
-      </description>
-      <arg name="id" type="new_id" interface="zwp_dcs_display_configuration"
-           summary="the new display configuration object"/>
-    </request>
-
     <request name="destroy" type="destructor">
       <description summary="destroy the DCS output object">
-        Destroys this object. The underlying wl_output and any
-        zwp_dcs_display_configuration objects created from this output are
-        not affected.
-      </description>
-    </request>
-  </interface>
-
-  <!-- ===================================================================
-       zwp_dcs_display_configuration
-
-       This object allows configuring one display in the system. It is one
-       part of a topology update which describes the updates to a specific
-       display.
-       =================================================================== -->
-  <interface name="zwp_dcs_display_configuration" version="1">
-    <description summary="single display configuration">
-      This object allows for configuring one display in the system. It takes
-      care of updating only one display and will be part of a broader
-      topology update which will control setting multiple configurations
-      across multiple displays/devices. Think of this like a description of
-      display state which will be applied during an atomic topology commit.
-
-      The configuration only needs to include the pieces of state which need
-      to be changed. Values which are omitted will not have their state
-      changed from what the display is currently using.
-    </description>
-
-    <enum name="error">
-      <description summary="zwp_dcs_display_configuration error codes"/>
-      <entry name="invalid_state" value="0"
-             summary="a component of this double-buffered commit could not be applied"/>
-    </enum>
-
-    <request name="set_mode">
-      <description summary="record the requested mode">
-        Records the mode to set with this configuration update, identified
-        by the id from a zwp_dcs_output.mode event of the output this
-        configuration was created from. An id that does not belong to that
-        output causes the topology commit to fail with an error event on
-        this configuration.
-      </description>
-      <arg name="id" type="uint" summary="id of the mode to set"/>
-    </request>
-
-    <request name="set_number">
-      <description summary="change the display ID number">
-        Changes the dcs_output's ID number.
-      </description>
-      <arg name="number" type="uint" summary="new display ID number"/>
-    </request>
-
-    <event name="error">
-      <description summary="configuration error">
-        Error returned on this object if part of its configuration failed.
-      </description>
-      <arg name="error" type="uint" enum="zwp_dcs_display_configuration.error"
-           summary="the error that occurred"/>
-    </event>
-
-    <request name="destroy" type="destructor">
-      <description summary="destroy the display configuration">
-        Destroys this configuration and discards its pending state. If it
-        has been added to a topology, it is removed from that topology and
-        takes no part in later commits of it. Sub-protocol configuration
-        objects created for this configuration are not destroyed, but the
-        state staged on them can no longer be applied and the client should
-        destroy them as well.
+        Destroys this object. The underlying wl_output is not affected, and
+        mode ids learned from this object stay valid for use with
+        zwp_dcs_topology.set_mode.
       </description>
     </request>
   </interface>
@@ -243,79 +190,128 @@
   <!-- ===================================================================
        zwp_dcs_topology
 
-       A topology combines multiple zwp_dcs_display_configuration objects
-       into one atomic state commit. Configurations represent changes to
-       an individual display; the topology represents changes to the entire
-       display wall.
+       A topology stages configuration changes for any number of displays
+       and commits them as one atomic update. Each request that changes
+       display state names the wl_output it applies to; there are no
+       per-display staging objects. Sub-protocols extend the topology with
+       their own topology objects following the same pattern.
        =================================================================== -->
   <interface name="zwp_dcs_topology" version="1">
     <description summary="multi-display atomic topology commit">
-      A topology combines multiple zwp_dcs_display_configuration objects into
-      one atomic state commit. These configs represent changes to an
-      individual display and the topology represents changes to the entire
-      display wall. The topology has a set of configs added to it, then once
-      everything is specified the topology is committed. If there are any
-      issues with the attempted configuration change then the topology will
-      return an error event signaling failure, and the specific
-      display_configuration objects causing the problem will receive error
-      events to hint what caused the commit to be rejected.
+      A topology stages configuration changes for any number of displays
+      and commits them as one atomic update to the display wall. Requests
+      that change display state take the wl_output of the display they
+      apply to. Setting the same value twice for one output replaces the
+      earlier value; nothing takes effect until commit.
+
+      Sub-protocols extend a topology with their own topology objects (for
+      example zwp_dcs_quadro_sync_topology), which stage their state the
+      same way and are applied by this object's commit.
+
+      The server will apply committed topologies one at a time in the order
+      they are received. Topologies may be committed with disjoint sets of
+      outputs and may be submitted in any order clients prefer, so long as
+      the updates to the display(s) are valid and correct. If there is an
+      issue with applying a specific configuration then eror events will
+      be sent so the client may correct it and re-commit. On success, the
+      done event is sent.
     </description>
 
     <enum name="error">
-      <description summary="zwp_dcs_topology error codes"/>
+      <description summary="zwp_dcs_topology error codes">
+        Codes sent with the error event. failed is only ever sent with a
+        null output and terminates a failed commit; the others name the
+        problem with one display.
+      </description>
       <entry name="failed" value="0"
-             summary="a component of this double-buffered commit could not be applied; the configuration objects will have an error posted to disclose more"/>
-      <entry name="duplicate_configs" value="1"
-             summary="multiple configurations were added that reference the same output object"/>
+             summary="the commit was rejected; nothing was applied"/>
+      <entry name="unknown_output" value="1"
+             summary="the wl_output is not a display managed by DCS"/>
+      <entry name="invalid_mode" value="2"
+             summary="the mode id does not belong to this output"/>
+      <entry name="invalid_state" value="3"
+             summary="the requested state for this display could not be validated or applied"/>
     </enum>
 
-    <request name="add_configuration">
-      <description summary="add a configuration to the topology">
-        Adds a configuration to the topology to be committed.
+    <request name="set_mode">
+      <description summary="stage a mode change for a display">
+        Stages a mode change for the given display. The id comes from a
+        zwp_dcs_output.mode event of the zwp_dcs_output created for this
+        same wl_output. An id that does not belong to the output makes the
+        commit fail with invalid_mode for this display.
       </description>
-      <arg name="config" type="object" interface="zwp_dcs_display_configuration"
-           summary="the display configuration to add"/>
+      <arg name="output" type="object" interface="wl_output"
+           summary="the display to change"/>
+      <arg name="id" type="uint" summary="id of the mode to set"/>
+    </request>
+
+    <request name="set_number">
+      <description summary="stage a display ID number change">
+        Stages a change of the display's ID number.
+      </description>
+      <arg name="output" type="object" interface="wl_output"
+           summary="the display to change"/>
+      <arg name="number" type="uint" summary="new display ID number"/>
     </request>
 
     <request name="commit">
-      <description summary="commit all configurations atomically">
-        Commits the changes to all configurations. The server answers every
-        commit with exactly one of the done or error events, sent after any
-        zwp_dcs_display_configuration.error events that belong to the same
-        commit. Commits are processed in order, so a client that waits for
-        the reply before committing again can match each reply to its
-        request.
+      <description summary="commit all staged changes atomically">
+        Commits every staged change in this topology and in the sub-protocol
+        topology objects created from it. The server answers every commit
+        with exactly one terminating event: done on success, or error with
+        a null output on failure. On failure, the terminating error is
+        preceded by one error event per display that had a problem, and by
+        any error events from sub-protocol topology objects. Commits are
+        processed in order, so a client that waits for the terminator before
+        committing again can match each reply to its request.
 
-        If the commit fails and error is sent, nothing was applied and the
-        topology stays alive with all of its pending state. The client can
-        adjust the offending configuration and commit again without
-        rebuilding the topology.
+        If a display named by this topology is removed before the commit is
+        processed, the commit fails with unknown_output for that display
+        and nothing is applied, as described on zwp_dcs_output. The staged
+        state for the other displays is kept, so the client may re-enumerate
+        and commit again without the missing display. A display connected
+        after a topology was created can be named by it normally.
 
-        If the commit succeeds and done is sent, the commit is complete and
-        the topology's lifetime is over. The client must destroy it, along
-        with any sub-protocol topology objects created from it. The
-        configurations that were added to it have been applied and should
-        be destroyed as well. The only request permitted on these objects
-        after done is destroy.
+        A commit changes only the displays it names. Every other display
+        keeps whatever state it had, whether that came from an earlier commit
+        or from the server's own configuration. Any number of topologies may
+        exist at once and their commits may name disjoint or overlapping sets
+        of displays. The server applies commits one at a time in the order
+        they arrive, for a display named by several commits the most recent
+        commit will be the final state. Sub-protocols define how their own
+        state behaves across commits, for example see
+        zwp_dcs_quadro_sync_topology.
+
+        If the commit fails, nothing was applied and the topology stays
+        alive with all of its staged state. The client can correct the
+        offending display and commit again without rebuilding the topology.
+
+        If the commit succeeds, the commit is complete and the topology's
+        lifetime is over. The client must destroy it, along with any
+        sub-protocol topology objects created from it. The only request
+        permitted on these objects after done is destroy.
       </description>
     </request>
 
     <event name="done">
       <description summary="topology commit succeeded">
-        Sent when every configuration in the committed topology was
-        validated and applied. The displays are now in the requested state
-        and the topology is finished, see commit for what the client must
-        do next.
+        Sent when every staged change was validated and applied. The
+        displays are now in the requested state and the topology is
+        finished; see commit for what the client must do next.
       </description>
     </event>
 
     <event name="error">
       <description summary="topology commit error">
-        Sent when the commit was rejected. Nothing was applied and the
-        topology stays alive so the client can correct it and commit again.
-        The configuration objects that caused the rejection receive their
-        own error events before this one.
+        Reports a problem with a commit. With a non-null output it names one
+        display and the reason its staged state was rejected; one such event
+        is sent per offending display. With a null output and the failed
+        code it reports that the commit as a whole was rejected and
+        terminates the reply. Nothing was applied and the topology stays
+        alive so the client can correct it and commit again.
       </description>
+      <arg name="output" type="object" interface="wl_output" allow-null="true"
+           summary="the display at fault, or null for the whole commit"/>
       <arg name="error" type="uint" enum="zwp_dcs_topology.error"
            summary="the error that occurred"/>
     </event>
@@ -324,12 +320,10 @@
       <description summary="destroy the topology">
         Destroys this topology. Any uncommitted state is discarded. This is
         the required final request after a commit reports done, and may
-        also be sent at any other time to abandon the topology. The
-        zwp_dcs_display_configuration objects added to it are not destroyed
-        and may be added to another topology. Sub-protocol topology objects
-        created from this topology are not destroyed, but since they can
-        only be applied through this topology's commit the client should
-        destroy them as well.
+        also be sent at any other time to abandon the topology.
+        Sub-protocol topology objects created from this topology are not
+        destroyed, but since they can only be applied through this
+        topology's commit the client should destroy them as well.
       </description>
     </request>
   </interface>

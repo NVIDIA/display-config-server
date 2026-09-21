@@ -4,21 +4,17 @@
 
 use anyhow::Context;
 use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle,
+    Connection, Dispatch, EventQueue, QueueHandle, WEnum,
     protocol::{wl_output::WlOutput, wl_registry},
 };
 
 use crate::output::{ModeInfo, OutputInfo};
 use crate::protocol::zwp_display_config_server_v1::{
-    zwp_dcs_display_configuration::{self, ZwpDcsDisplayConfiguration},
     zwp_dcs_manager::{self, ZwpDcsManager},
     zwp_dcs_output::{self, ZwpDcsOutput},
     zwp_dcs_topology::{self, ZwpDcsTopology},
 };
 use crate::protocol::zwp_dcs_quadro_sync_v1::{
-    zwp_dcs_quadro_sync_display_configuration::{
-        self, ZwpDcsQuadroSyncDisplayConfiguration,
-    },
     zwp_dcs_quadro_sync_manager::{self, ZwpDcsQuadroSyncManager},
     zwp_dcs_quadro_sync_output::{self, ZwpDcsQuadroSyncOutput},
     zwp_dcs_quadro_sync_topology::{self, ZwpDcsQuadroSyncTopology},
@@ -48,8 +44,9 @@ pub(crate) struct PendingOutput {
     pub qs_board: Option<u32>,
 }
 
-/// A fully-resolved output: the raw `wl_output` proxy (needed for
-/// subsequent `get_output` calls in `apply`) paired with its current info.
+/// A fully-resolved output: the raw `wl_output` proxy (the handle every
+/// topology request in `apply` uses to name the display) paired with its
+/// current info.
 #[derive(Clone)]
 pub(crate) struct BoundOutput {
     pub wl_output: WlOutput,
@@ -72,12 +69,14 @@ pub(crate) struct ClientState {
     pub pending: Vec<PendingOutput>,
     /// Fully resolved outputs; set at the end of `enumerate_outputs`.
     pub bound_outputs: Vec<BoundOutput>,
-    /// Set to true if a topology commit error event is received.
     /// Set by `zwp_dcs_topology.done`; the server applied the last commit.
     pub topology_done: bool,
-    pub topology_error: bool,
-    /// Set to true if a display configuration error event is received.
-    pub config_error: bool,
+    /// Every `zwp_dcs_topology.error` from the last commit: the display at
+    /// fault (`None` for the terminating topology-wide error) and the code.
+    pub topology_errors: Vec<(Option<WlOutput>, WEnum<zwp_dcs_topology::Error>)>,
+    /// Every `zwp_dcs_quadro_sync_topology.error` from the last commit.
+    pub quadro_sync_errors:
+        Vec<(Option<WlOutput>, WEnum<zwp_dcs_quadro_sync_topology::Error>)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,8 +132,8 @@ pub fn connect() -> anyhow::Result<DcsClient> {
         pending: Vec::new(),
         bound_outputs: Vec::new(),
         topology_done: false,
-        topology_error: false,
-        config_error: false,
+        topology_errors: Vec::new(),
+        quadro_sync_errors: Vec::new(),
     };
 
     conn.display().get_registry(&qh, ());
@@ -278,25 +277,8 @@ impl Dispatch<ZwpDcsTopology, ()> for ClientState {
             zwp_dcs_topology::Event::Done => {
                 state.topology_done = true;
             }
-            zwp_dcs_topology::Event::Error { .. } => {
-                state.topology_error = true;
-            }
-        }
-    }
-}
-
-impl Dispatch<ZwpDcsDisplayConfiguration, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwpDcsDisplayConfiguration,
-        event: zwp_dcs_display_configuration::Event,
-        _: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwp_dcs_display_configuration::Event::Error { .. } => {
-                state.config_error = true;
+            zwp_dcs_topology::Event::Error { output, error } => {
+                state.topology_errors.push((output, error));
             }
         }
     }
@@ -355,30 +337,19 @@ impl Dispatch<ZwpDcsQuadroSyncOutput, ()> for ClientState {
     }
 }
 
-impl Dispatch<ZwpDcsQuadroSyncDisplayConfiguration, ()> for ClientState {
-    fn event(
-        _state: &mut Self,
-        _: &ZwpDcsQuadroSyncDisplayConfiguration,
-        _event: zwp_dcs_quadro_sync_display_configuration::Event,
-        _: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        // zwp_dcs_quadro_sync_display_configuration has no events in v1.
-        // Commit errors surface through the base protocol's error events.
-    }
-}
-
 impl Dispatch<ZwpDcsQuadroSyncTopology, ()> for ClientState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _: &ZwpDcsQuadroSyncTopology,
-        _event: zwp_dcs_quadro_sync_topology::Event,
+        event: zwp_dcs_quadro_sync_topology::Event,
         _: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        // zwp_dcs_quadro_sync_topology has no events in v1.
-        // Commit errors surface through the base protocol's error events.
+        match event {
+            zwp_dcs_quadro_sync_topology::Event::Error { output, error } => {
+                state.quadro_sync_errors.push((output, error));
+            }
+        }
     }
 }
