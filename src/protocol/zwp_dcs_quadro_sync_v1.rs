@@ -22,7 +22,7 @@ use crate::protocols::zwp_dcs_quadro_sync_v1::{
 };
 use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::WEnum;
-use crate::protocol::zwp_display_config_server_v1::{CommitFailure, WlDcsOutput};
+use crate::protocol::zwp_display_config_server_v1::WlDcsOutput;
 use crate::DcsState;
 
 // ---------------------------------------------------------------------------
@@ -285,16 +285,17 @@ impl DcsState {
     /// Returns `Ok(None)` when nothing QuadroSync-related was staged, so a
     /// topology that merely created the extension does not touch framelock.
     /// Per-display problems (an output DCS does not manage, an out-of-range
-    /// role) come back as [`CommitFailure`]s so the commit reply can name
-    /// each display; role-count and board validation happen later in the
-    /// attribute's own `validate`.
+    /// role) are sent as error events on the extension right here, and the
+    /// build returns `Err` so the commit is reported as failed. The returned
+    /// attribute carries the extension object and each role's `wl_output`
+    /// so it can send its own error events during validate() and apply().
     ///
     /// Called by the base topology's `Commit` handler, which owns the
     /// [`PendingCommit`](crate::attribute::PendingCommit) the result goes into.
     pub fn build_quadro_sync_attribute(
         &self,
         qs_topo_resource: &ZwpDcsQuadroSyncTopology,
-    ) -> Result<Option<QuadroSyncTopologyAttribute>, Vec<CommitFailure>> {
+    ) -> anyhow::Result<Option<QuadroSyncTopologyAttribute>> {
         let topo = qs_topo_resource
             .data::<Mutex<WlQuadroSyncTopology>>()
             .expect("wrong user data type on zwp_dcs_quadro_sync_topology")
@@ -302,32 +303,35 @@ impl DcsState {
             .unwrap();
 
         let mut roles = Vec::new();
-        let mut failures = Vec::new();
+        let mut rejected = 0usize;
 
         for pending in topo.roles.iter().filter(|r| r.output.is_alive()) {
             let output = pending
                 .handle
                 .and_then(|handle| self.output_for_handle(handle).map(|o| (handle, o)));
             let Some((handle, dcs_output)) = output else {
-                failures.push(CommitFailure::QuadroSyncDisplay {
-                    output: pending.output.clone(),
-                    error: QuadroSyncError::UnknownOutput,
-                });
+                qs_topo_resource.error(Some(&pending.output), QuadroSyncError::UnknownOutput);
+                rejected += 1;
                 continue;
             };
             let Some(role) = pending.role else {
-                failures.push(CommitFailure::QuadroSyncDisplay {
-                    output: pending.output.clone(),
-                    error: QuadroSyncError::InvalidRole,
-                });
+                qs_topo_resource.error(Some(&pending.output), QuadroSyncError::InvalidRole);
+                rejected += 1;
                 continue;
             };
             let connector_id: u32 = dcs_output.connector_handle.into();
-            roles.push((handle, QuadroSyncRoleAttribute { connector_id, role }));
+            roles.push((
+                handle,
+                QuadroSyncRoleAttribute {
+                    connector_id,
+                    role,
+                    wl_output: Some(pending.output.clone()),
+                },
+            ));
         }
 
-        if !failures.is_empty() {
-            return Err(failures);
+        if rejected > 0 {
+            anyhow::bail!("{} QuadroSync role(s) rejected", rejected);
         }
 
         let has_board_settings = topo.pending_sync_delay.is_some()
@@ -339,6 +343,7 @@ impl DcsState {
         }
 
         Ok(Some(QuadroSyncTopologyAttribute {
+            resource: Some(qs_topo_resource.clone()),
             roles,
             sync_delay: topo.pending_sync_delay,
             polarity: topo.pending_polarity,

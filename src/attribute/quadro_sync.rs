@@ -11,6 +11,13 @@ use crate::render::dcs_output::DcsOutput;
 use crate::render::quadro_sync::{board_for_device, QuadroSyncBoard};
 use crate::render::DcsDevice;
 use crate::DcsState;
+use wayland_server::protocol::wl_output::WlOutput;
+use wayland_server::Resource;
+
+use crate::protocols::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_topology::{
+    Error as QuadroSyncError, ZwpDcsQuadroSyncTopology,
+};
+use crate::protocol::zwp_display_config_server_v1::WlDcsTopology;
 use super::{DisplayAttribute, TopologyAttribute};
 
 // ---------------------------------------------------------------------------
@@ -328,6 +335,9 @@ pub enum HouseSyncMode {
 pub struct QuadroSyncRoleAttribute {
     pub connector_id: u32,
     pub role: QuadroSyncRole,
+    /// The `wl_output` the client named when staging this role, so a
+    /// per-display error can point at it. `None` in unit tests.
+    pub wl_output: Option<WlOutput>,
 }
 
 impl DisplayAttribute for QuadroSyncRoleAttribute {
@@ -388,12 +398,41 @@ fn validate_role_counts(servers: u32, clients: u32, sync_enable: bool) -> anyhow
     Ok(())
 }
 
+/// Members of a framelock group whose refresh rate differs from the group's.
+///
+/// Every member must match the server, since clients lock to the server's
+/// sync signal. On a client-only system the server is on another machine and
+/// cannot be seen, so the local members must at least agree with each other;
+/// the first member is then the reference. Returns `(handle, member rate,
+/// reference rate)` for each mismatch.
+fn refresh_mismatches(
+    members: &[(OutputHandle, QuadroSyncRole, u32)],
+) -> Vec<(OutputHandle, u32, u32)> {
+    if members.len() < 2 {
+        return Vec::new();
+    }
+    let reference = members
+        .iter()
+        .find(|(_, role, _)| *role == QuadroSyncRole::Server)
+        .map(|(_, _, refresh)| *refresh)
+        .unwrap_or(members[0].2);
+    members
+        .iter()
+        .filter(|(_, _, refresh)| *refresh != reference)
+        .map(|(handle, _, refresh)| (*handle, *refresh, reference))
+        .collect()
+}
+
 /// Cross-output framelock board configuration.  Owns per-output role attributes.
 ///
 /// Roles are stored directly (not as `Box<dyn DisplayAttribute>`) so we can
 /// access `connector_id` and `role` without downcasting.  `display_attributes()`
 /// returns an empty slice; the parent applies its children itself.
 pub struct QuadroSyncTopologyAttribute {
+    /// The zwp_dcs_quadro_sync_topology this attribute was built from. The
+    /// attribute sends its own error events on it during validate() and
+    /// apply(). `None` in unit tests, where there is no Wayland display.
+    pub resource: Option<ZwpDcsQuadroSyncTopology>,
     /// Per-output role assignments (output handle, role).
     pub roles: Vec<(OutputHandle, QuadroSyncRoleAttribute)>,
     /// Board-level settings.
@@ -420,17 +459,64 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
         self.roles.iter().map(|(handle, _)| *handle).collect()
     }
 
-    fn validate(&self, state: &DcsState) -> anyhow::Result<()> {
+    fn validate(&self, state: &DcsState, topology: &WlDcsTopology) -> anyhow::Result<()> {
         use std::os::unix::io::{AsFd, AsRawFd};
 
+        // Group-wide problems are reported with a null output and returned
+        // for the log; per-display problems are sent on the offending
+        // display as they are found. Either fails the commit.
+        let mut problems: Vec<String> = Vec::new();
+        let mut display_faults = 0usize;
         let mut servers = 0u32;
         let mut clients = 0u32;
 
-        // A commit touches only the displays it names, so a server already
-        // configured on any other QuadroSync-capable display stays in place
-        // and counts against the one-server limit. Clients are not counted
-        // here: the "at least one role" check below is about what this
-        // commit will actually enable, and that is only the displays named.
+        // Every display that will be in the framelock group after this
+        // commit, with the refresh rate it will be running: the rate of a
+        // mode change staged for it in the same topology if there is one,
+        // else its current rate. Framelock clients lock to the server's sync
+        // signal, so a member at a different refresh rate never engages;
+        // nvkms does not check this, it just leaves SYNC_READY false.
+        let mut members: Vec<(OutputHandle, QuadroSyncRole, u32)> = Vec::new();
+        let refresh_for = |handle: OutputHandle, output: &DcsOutput| -> u32 {
+            topology
+                .updates
+                .iter()
+                .find(|u| u.handle == Some(handle))
+                .and_then(|u| u.staged_mode(output))
+                .map(|m| m.vrefresh() * 1000)
+                .unwrap_or(output.mode_refresh_mhz)
+        };
+
+        for (handle, role_attr) in &self.roles {
+            let Some(output) = state.output_for_handle(*handle) else {
+                problems.push(format!("QuadroSync role references unknown output {:?}", handle));
+                continue;
+            };
+            if state.board_for_device(handle.device_index).is_none() {
+                tracing::error!(
+                    "display {} is on a GPU without QuadroSync hardware and cannot take a QuadroSync role",
+                    output.display_number
+                );
+                self.send_error(role_attr.wl_output.as_ref(), QuadroSyncError::NoHardware);
+                display_faults += 1;
+                continue;
+            }
+            match role_attr.role {
+                QuadroSyncRole::Server => servers += 1,
+                QuadroSyncRole::Client => clients += 1,
+                QuadroSyncRole::Disabled => {}
+            }
+            if role_attr.role != QuadroSyncRole::Disabled {
+                members.push((*handle, role_attr.role, refresh_for(*handle, output)));
+            }
+        }
+
+        // A commit touches only the displays it names, so roles already
+        // configured on other QuadroSync-capable displays stay in place: an
+        // existing server counts against the one-server limit, and every
+        // existing member takes part in the refresh check. Existing clients
+        // are not counted toward the "at least one role" check, which is
+        // about what this commit will actually enable.
         let named: Vec<OutputHandle> = self.roles.iter().map(|(h, _)| *h).collect();
         for (device_index, device) in state.devices.iter().enumerate() {
             if state.board_for_device(device_index).is_none() {
@@ -444,8 +530,13 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
                 }
                 let connector_id: u32 = output.connector_handle.into();
                 match get_display_config(fd, connector_id) {
-                    Ok(QuadroSyncRole::Server) => servers += 1,
-                    Ok(_) => {}
+                    Ok(QuadroSyncRole::Disabled) => {}
+                    Ok(role) => {
+                        if role == QuadroSyncRole::Server {
+                            servers += 1;
+                        }
+                        members.push((handle, role, refresh_for(handle, output)));
+                    }
                     Err(e) => tracing::debug!(
                         "framelock display config query failed for connector {}: {}",
                         connector_id,
@@ -455,29 +546,67 @@ impl TopologyAttribute for QuadroSyncTopologyAttribute {
             }
         }
 
-        for (handle, role_attr) in &self.roles {
-            let output = state
-                .output_for_handle(*handle)
-                .ok_or_else(|| anyhow!("QuadroSync role references unknown output {:?}", handle))?;
-            if state.board_for_device(handle.device_index).is_none() {
-                return Err(anyhow!(
-                    "display {} is on a GPU without QuadroSync hardware and cannot take a QuadroSync role",
-                    output.display_number
-                ));
-            }
-            match role_attr.role {
-                QuadroSyncRole::Server => servers += 1,
-                QuadroSyncRole::Client => clients += 1,
-                QuadroSyncRole::Disabled => {}
-            }
+        if let Err(e) = validate_role_counts(servers, clients, self.sync_enable) {
+            problems.push(e.to_string());
         }
 
-        validate_role_counts(servers, clients, self.sync_enable)
+        for (handle, refresh, reference) in refresh_mismatches(&members) {
+            let number = state
+                .output_for_handle(handle)
+                .map(|o| o.display_number)
+                .unwrap_or(-1);
+            tracing::error!(
+                "display {} runs at {} mHz but the framelock group runs at {} mHz",
+                number,
+                refresh,
+                reference
+            );
+            // A member this commit did not name has no wl_output in the
+            // commit to point at; it is reported group-wide.
+            self.send_error(self.wl_output_for(handle), QuadroSyncError::RefreshMismatch);
+            display_faults += 1;
+        }
+
+        if !problems.is_empty() {
+            self.send_error(None, QuadroSyncError::Failed);
+        }
+
+        if problems.is_empty() && display_faults == 0 {
+            Ok(())
+        } else if problems.is_empty() {
+            Err(anyhow!("{} display(s) rejected", display_faults))
+        } else {
+            Err(anyhow!("{}", problems.join("; ")))
+        }
     }
 
     fn apply(&self, state: &mut DcsState) -> anyhow::Result<()> {
         let mut io = DrmQuadroSyncIoctls::new(&state.devices, self.framelock_index);
-        self.apply_with(&state.quadro_sync_boards, &mut io)
+        let result = self.apply_with(&state.quadro_sync_boards, &mut io);
+        if result.is_err() {
+            self.send_error(None, QuadroSyncError::Failed);
+        }
+        result
+    }
+}
+
+impl QuadroSyncTopologyAttribute {
+    /// Send an error event on the QuadroSync topology object this attribute
+    /// was built from. A null `output` reports a group-wide problem.
+    fn send_error(&self, output: Option<&WlOutput>, error: QuadroSyncError) {
+        if let Some(resource) = &self.resource {
+            if resource.is_alive() {
+                resource.error(output, error);
+            }
+        }
+    }
+
+    /// The `wl_output` the client named for `handle`, if this commit named it.
+    fn wl_output_for(&self, handle: OutputHandle) -> Option<&WlOutput> {
+        self.roles
+            .iter()
+            .find(|(h, _)| *h == handle)
+            .and_then(|(_, r)| r.wl_output.as_ref())
     }
 }
 
@@ -741,7 +870,7 @@ mod tests {
     }
 
     fn role(device_index: usize, connector_id: u32, role: QuadroSyncRole) -> (OutputHandle, QuadroSyncRoleAttribute) {
-        (handle(device_index, connector_id), QuadroSyncRoleAttribute { connector_id, role })
+        (handle(device_index, connector_id), QuadroSyncRoleAttribute { connector_id, role, wl_output: None })
     }
 
     fn two_boards() -> Vec<QuadroSyncBoard> {
@@ -757,6 +886,7 @@ mod tests {
 
     fn attr(roles: Vec<(OutputHandle, QuadroSyncRoleAttribute)>, sync_enable: bool) -> QuadroSyncTopologyAttribute {
         QuadroSyncTopologyAttribute {
+            resource: None,
             roles,
             sync_delay: Some(3),
             polarity: None,
@@ -884,4 +1014,35 @@ mod tests {
     fn no_roles_rejected() {
         assert!(validate_role_counts(0, 0, true).is_err());
     }
+
+    #[test]
+    fn refresh_mismatch_uses_server_as_reference() {
+        let members = vec![
+            (handle(0, 1), QuadroSyncRole::Client, 59_940),
+            (handle(0, 2), QuadroSyncRole::Server, 60_000),
+            (handle(0, 3), QuadroSyncRole::Client, 60_000),
+        ];
+        let bad = refresh_mismatches(&members);
+        assert_eq!(bad, vec![(handle(0, 1), 59_940, 60_000)]);
+    }
+
+    #[test]
+    fn refresh_mismatch_client_only_uses_first_member() {
+        let members = vec![
+            (handle(0, 1), QuadroSyncRole::Client, 60_000),
+            (handle(0, 2), QuadroSyncRole::Client, 120_000),
+        ];
+        assert_eq!(refresh_mismatches(&members), vec![(handle(0, 2), 120_000, 60_000)]);
+    }
+
+    #[test]
+    fn refresh_mismatch_none_when_matching_or_single() {
+        assert!(refresh_mismatches(&[(handle(0, 1), QuadroSyncRole::Server, 60_000)]).is_empty());
+        let members = vec![
+            (handle(0, 1), QuadroSyncRole::Server, 60_000),
+            (handle(0, 2), QuadroSyncRole::Client, 60_000),
+        ];
+        assert!(refresh_mismatches(&members).is_empty());
+    }
+
 }

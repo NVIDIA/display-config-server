@@ -159,8 +159,7 @@
         The DRM device that drives this output. The array holds the dev_t of
         the device's primary node as an array of sizeof(dev_t) bytes in
         native byte order, the same encoding wp_linux_dmabuf_feedback uses
-        for main_device. Clients compare devices by value rather than by
-        node path, and must not assume a particular size for dev_t.
+        for main_device.
       </description>
       <arg name="device" type="array" summary="dev_t of the DRM device"/>
     </event>
@@ -219,12 +218,9 @@
 
     <enum name="error">
       <description summary="zwp_dcs_topology error codes">
-        Codes sent with the error event. failed is only ever sent with a
-        null output and terminates a failed commit; the others name the
-        problem with one display.
+        Reasons a display's staged state was rejected, sent with the error
+        event.
       </description>
-      <entry name="failed" value="0"
-             summary="the commit was rejected; nothing was applied"/>
       <entry name="unknown_output" value="1"
              summary="the wl_output is not a display managed by DCS"/>
       <entry name="invalid_mode" value="2"
@@ -258,12 +254,12 @@
       <description summary="commit all staged changes atomically">
         Commits every staged change in this topology and in the sub-protocol
         topology objects created from it. The server answers every commit
-        with exactly one terminating event: done on success, or error with
-        a null output on failure. On failure, the terminating error is
-        preceded by one error event per display that had a problem, and by
-        any error events from sub-protocol topology objects. Commits are
-        processed in order, so a client that waits for the terminator before
-        committing again can match each reply to its request.
+        with any number of error events, one per display that had a problem,
+        any number of error events from sub-protocol topology objects, and
+        then exactly one done event whose success argument says whether the
+        commit was applied. done is always the last event of the reply.
+        Commits are processed in order, so a client that waits for done
+        before committing again can match each reply to its request.
 
         If a display named by this topology is removed before the commit is
         processed, the commit fails with unknown_output for that display
@@ -294,24 +290,27 @@
     </request>
 
     <event name="done">
-      <description summary="topology commit succeeded">
-        Sent when every staged change was validated and applied. The
-        displays are now in the requested state and the topology is
-        finished; see commit for what the client must do next.
+      <description summary="topology commit finished">
+        Ends the reply to a commit. With success set, every staged change
+        was validated and applied, the displays are in the requested state,
+        and the topology is finished; see commit for what the client must do
+        next. With success clear, nothing was applied and the topology stays
+        alive so the client can correct it and commit again. Any error
+        events explaining a failure were sent before this event; a failure
+        with no error events means the problem was not specific to one
+        display and the server logged the reason.
       </description>
+      <arg name="success" type="uint" summary="1 if the commit was applied, 0 if not"/>
     </event>
 
     <event name="error">
-      <description summary="topology commit error">
-        Reports a problem with a commit. With a non-null output it names one
-        display and the reason its staged state was rejected; one such event
-        is sent per offending display. With a null output and the failed
-        code it reports that the commit as a whole was rejected and
-        terminates the reply. Nothing was applied and the topology stays
-        alive so the client can correct it and commit again.
+      <description summary="per-display commit error">
+        Names one display whose staged state was rejected and the reason.
+        One event is sent per offending display, before the done event that
+        ends the reply.
       </description>
-      <arg name="output" type="object" interface="wl_output" allow-null="true"
-           summary="the display at fault, or null for the whole commit"/>
+      <arg name="output" type="object" interface="wl_output"
+           summary="the display at fault"/>
       <arg name="error" type="uint" enum="zwp_dcs_topology.error"
            summary="the error that occurred"/>
     </event>

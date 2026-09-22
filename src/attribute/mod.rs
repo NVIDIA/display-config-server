@@ -13,9 +13,11 @@ pub mod display_number;
 pub mod mode;
 pub mod quadro_sync;
 
+use crate::protocol::zwp_display_config_server_v1::WlDcsTopology;
 use crate::render::dcs_output::OutputHandle;
 use crate::render::dcs_output::DcsOutput;
 use crate::DcsState;
+
 
 /// A per-output attribute that configures one display.
 ///
@@ -47,8 +49,16 @@ pub trait TopologyAttribute: Send + Sync {
     /// Every output this topology attribute touches, possibly across devices.
     fn output_handles(&self) -> Vec<OutputHandle>;
     /// Validate cross-output invariants (e.g., exactly one server) against
-    /// every device DCS manages.
-    fn validate(&self, state: &DcsState) -> anyhow::Result<()>;
+    /// every device DCS manages. `topology` is the whole staged commit, so
+    /// the attribute can take into account state other parts of the same
+    /// commit will set (for example a mode change on a framelock member).
+    ///
+    /// The attribute owns the sub-protocol topology object it was built
+    /// from and sends its own error events on it as problems are found,
+    /// checking everything rather than stopping at the first. The return
+    /// value says whether the attribute can be applied; `Err` carries the
+    /// reasons for the log.
+    fn validate(&self, state: &DcsState, topology: &WlDcsTopology) -> anyhow::Result<()>;
     /// Apply this attribute across devices, including all owned child display
     /// attributes.
     fn apply(&self, state: &mut DcsState) -> anyhow::Result<()>;

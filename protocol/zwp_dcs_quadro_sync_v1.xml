@@ -133,8 +133,19 @@
       Role validation counts servers across the whole system: the roles
       staged in this commit plus the roles already configured on displays
       it does not name. A commit that would leave more than one server on
-      this system is rejected with a null-output failed error, so building
+      this system is rejected with a null-output failed error before the
+      base topology's done, so building
       a group up over several commits cannot produce two servers.
+
+      Every member of the group must run at the same refresh rate, since a
+      client locks to the server's sync signal and a member at another rate
+      never engages. Validation checks the rate each member will have after
+      the commit, taking mode changes staged in the same zwp_dcs_topology
+      into account, against the server's rate (or, on a system with no
+      local server, against the other local members). A mismatching display
+      named in this commit is reported with refresh_mismatch; a mismatch on
+      a member this commit does not name is reported as a null-output failed
+      error, since there is no wl_output in the commit to attach it to.
 
       Board-level settings (sync delay, polarity, house sync mode) are
       properties of the sync source. They are applied to the board of the
@@ -154,6 +165,10 @@
              summary="the wl_output is not a display managed by DCS"/>
       <entry name="invalid_role" value="2"
              summary="the role is not a valid zwp_dcs_quadro_sync_output.role value"/>
+      <entry name="no_hardware" value="3"
+             summary="the display's GPU has no QuadroSync hardware"/>
+      <entry name="refresh_mismatch" value="4"
+             summary="the display's refresh rate differs from the framelock group's"/>
     </enum>
 
     <enum name="polarity">
@@ -206,8 +221,9 @@
         was rejected. With a null output and the failed code it reports that
         the QuadroSync settings as a whole were rejected, for example
         because the role assignments cannot form a valid framelock chain.
-        These events are sent before the base zwp_dcs_topology's
-        terminating error event; this object never sends done.
+        These events are sent before the base zwp_dcs_topology's done event,
+        which then reports the commit as failed; this object never sends
+        done itself.
       </description>
       <arg name="output" type="object" interface="wl_output" allow-null="true"
            summary="the display at fault, or null for the whole QuadroSync configuration"/>

@@ -69,11 +69,13 @@ pub(crate) struct ClientState {
     pub pending: Vec<PendingOutput>,
     /// Fully resolved outputs; set at the end of `enumerate_outputs`.
     pub bound_outputs: Vec<BoundOutput>,
-    /// Set by `zwp_dcs_topology.done`; the server applied the last commit.
+    /// Set by `zwp_dcs_topology.done`; the reply to the last commit is complete.
     pub topology_done: bool,
+    /// The `success` argument of that `done`.
+    pub topology_success: bool,
     /// Every `zwp_dcs_topology.error` from the last commit: the display at
-    /// fault (`None` for the terminating topology-wide error) and the code.
-    pub topology_errors: Vec<(Option<WlOutput>, WEnum<zwp_dcs_topology::Error>)>,
+    /// fault and the code.
+    pub topology_errors: Vec<(WlOutput, WEnum<zwp_dcs_topology::Error>)>,
     /// Every `zwp_dcs_quadro_sync_topology.error` from the last commit.
     pub quadro_sync_errors:
         Vec<(Option<WlOutput>, WEnum<zwp_dcs_quadro_sync_topology::Error>)>,
@@ -132,6 +134,7 @@ pub fn connect() -> anyhow::Result<DcsClient> {
         pending: Vec::new(),
         bound_outputs: Vec::new(),
         topology_done: false,
+        topology_success: false,
         topology_errors: Vec::new(),
         quadro_sync_errors: Vec::new(),
     };
@@ -274,8 +277,9 @@ impl Dispatch<ZwpDcsTopology, ()> for ClientState {
         _qh: &QueueHandle<Self>,
     ) {
         match event {
-            zwp_dcs_topology::Event::Done => {
+            zwp_dcs_topology::Event::Done { success } => {
                 state.topology_done = true;
+                state.topology_success = success != 0;
             }
             zwp_dcs_topology::Event::Error { output, error } => {
                 state.topology_errors.push((output, error));

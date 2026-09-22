@@ -118,6 +118,7 @@ impl DcsClient {
 
         // Reset the reply state before commit.
         self.state.topology_done = false;
+        self.state.topology_success = false;
         self.state.topology_errors.clear();
         self.state.quadro_sync_errors.clear();
 
@@ -138,7 +139,14 @@ impl DcsClient {
 
         roundtrip?;
 
-        if !self.state.topology_errors.is_empty() || !self.state.quadro_sync_errors.is_empty() {
+        // The server ends every commit reply with done, and the roundtrip
+        // above returns only after it has processed the commit, so a missing
+        // done is a server bug rather than a slow server.
+        if !self.state.topology_done {
+            anyhow::bail!("DCS did not acknowledge the topology commit");
+        }
+
+        if !self.state.topology_success {
             anyhow::bail!(
                 "topology commit rejected by DCS:{}",
                 describe_failures(
@@ -147,13 +155,6 @@ impl DcsClient {
                     &self.state.quadro_sync_errors,
                 )
             );
-        }
-
-        // The server replies to every commit with done or error, and the
-        // roundtrip above returns only after it has processed the commit,
-        // so a missing reply is a server bug rather than a slow server.
-        if !self.state.topology_done {
-            anyhow::bail!("DCS did not acknowledge the topology commit");
         }
 
         Ok(())
@@ -166,7 +167,7 @@ impl DcsClient {
 /// all the server sent.
 fn describe_failures(
     bound_outputs: &[BoundOutput],
-    topology_errors: &[(Option<WlOutput>, WEnum<TopologyError>)],
+    topology_errors: &[(WlOutput, WEnum<TopologyError>)],
     quadro_sync_errors: &[(Option<WlOutput>, WEnum<QuadroSyncError>)],
 ) -> String {
     let display_name = |output: &WlOutput| -> String {
@@ -188,22 +189,24 @@ fn describe_failures(
             WEnum::Value(TopologyError::InvalidState) => {
                 "the requested state could not be validated or applied"
             }
-            WEnum::Value(TopologyError::Failed) => "the commit was rejected",
             WEnum::Unknown(code) => {
                 lines.push(format!("\n  unknown topology error code {}", code));
                 continue;
             }
         };
-        match output {
-            Some(output) => lines.push(format!("\n  {}: {}", display_name(output), reason)),
-            None => {}
-        }
+        lines.push(format!("\n  {}: {}", display_name(output), reason));
     }
 
     for (output, error) in quadro_sync_errors {
         let reason = match error {
             WEnum::Value(QuadroSyncError::UnknownOutput) => "not a display managed by DCS",
             WEnum::Value(QuadroSyncError::InvalidRole) => "invalid QuadroSync role",
+            WEnum::Value(QuadroSyncError::NoHardware) => {
+                "this display's GPU has no QuadroSync hardware"
+            }
+            WEnum::Value(QuadroSyncError::RefreshMismatch) => {
+                "refresh rate differs from the rest of the framelock group"
+            }
             WEnum::Value(QuadroSyncError::Failed) => {
                 "QuadroSync settings rejected as a whole (check server/client roles and sync)"
             }
@@ -221,7 +224,7 @@ fn describe_failures(
     }
 
     if lines.is_empty() {
-        String::from(" no display-specific detail was reported")
+        String::from(" no display-specific detail was reported (see the DCS log)")
     } else {
         lines.concat()
     }

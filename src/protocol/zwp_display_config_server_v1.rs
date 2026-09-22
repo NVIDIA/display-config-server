@@ -29,15 +29,13 @@ use std::sync::Mutex;
 use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
-use crate::render::dcs_output::OutputHandle;
+use crate::render::dcs_output::{DcsOutput, OutputHandle};
 
+use crate::protocols::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_topology::ZwpDcsQuadroSyncTopology;
 use crate::protocols::zwp_display_config_server_v1::{
     zwp_dcs_manager::{self, ZwpDcsManager},
     zwp_dcs_output::{self, ZwpDcsOutput},
     zwp_dcs_topology::{self, Error as TopologyError, ZwpDcsTopology},
-};
-use crate::protocols::zwp_dcs_quadro_sync_v1::zwp_dcs_quadro_sync_topology::{
-    Error as QuadroSyncError, ZwpDcsQuadroSyncTopology,
 };
 use crate::DcsState;
 
@@ -58,7 +56,7 @@ pub struct WlDcsOutput {
 }
 
 /// State staged for one display by `set_mode` / `set_number`.
-pub struct PendingDisplay {
+pub struct PendingUpdate {
     /// The `wl_output` the client named. Kept so commit errors can point at it.
     pub output: WlOutput,
     /// Resolved from the `wl_output`'s user data when the first request for
@@ -77,8 +75,9 @@ pub struct PendingDisplay {
 /// receives `&UserData` (not `&mut`) and wayland-server requires
 /// `UserData: Send + Sync`.
 pub struct WlDcsTopology {
-    /// Displays with staged changes, in the order the client first named them.
-    pub displays: Vec<PendingDisplay>,
+    /// Staged changes, one entry per display, in the order the client first
+    /// named each one.
+    pub updates: Vec<PendingUpdate>,
     /// Optional QuadroSync topology extension, set when a client calls
     /// `zwp_dcs_quadro_sync_manager.get_topology(this_topology)`.
     pub quadro_sync_topology: Option<ZwpDcsQuadroSyncTopology>,
@@ -86,17 +85,17 @@ pub struct WlDcsTopology {
 
 impl WlDcsTopology {
     /// The staging entry for `output`, created on first use.
-    fn display_mut(&mut self, output: &WlOutput) -> &mut PendingDisplay {
-        if let Some(i) = self.displays.iter().position(|d| d.output == *output) {
-            return &mut self.displays[i];
+    fn update_mut(&mut self, output: &WlOutput) -> &mut PendingUpdate {
+        if let Some(i) = self.updates.iter().position(|d| d.output == *output) {
+            return &mut self.updates[i];
         }
-        self.displays.push(PendingDisplay {
+        self.updates.push(PendingUpdate {
             output: output.clone(),
             handle: output.data::<OutputHandle>().copied(),
             mode_id: None,
             number: None,
         });
-        self.displays.last_mut().unwrap()
+        self.updates.last_mut().unwrap()
     }
 
     /// Forget any protocol objects the client has destroyed since we last
@@ -104,26 +103,15 @@ impl WlDcsTopology {
     /// QuadroSync extension no longer contributes to the commit. Called before
     /// every use of the lists so a dead resource is never dereferenced.
     pub fn prune_dead(&mut self) {
-        self.displays.retain(|d| d.output.is_alive());
-        if self.quadro_sync_topology.as_ref().is_some_and(|t| !t.is_alive()) {
+        self.updates.retain(|d| d.output.is_alive());
+        if self
+            .quadro_sync_topology
+            .as_ref()
+            .is_some_and(|t| !t.is_alive())
+        {
             self.quadro_sync_topology = None;
         }
     }
-}
-
-/// One problem found while committing a topology.
-///
-/// `apply_topology` collects these instead of stopping at the first failure,
-/// so the client hears about every display at fault in one reply. The
-/// `Commit` handler turns each one into an `error` event on the right
-/// protocol object.
-pub enum CommitFailure {
-    /// A display's staged base state was rejected.
-    Display { output: WlOutput, error: TopologyError },
-    /// A display's staged QuadroSync role was rejected.
-    QuadroSyncDisplay { output: WlOutput, error: QuadroSyncError },
-    /// The QuadroSync settings were rejected as a whole (e.g. role counts).
-    QuadroSync,
 }
 
 /// The opaque mode id advertised for `connector_modes[index]`.
@@ -131,10 +119,25 @@ pub enum CommitFailure {
 /// Internally the id is just the index into the output's DRM mode list. The
 /// protocol keeps it opaque so the server is free to change this later, but
 /// the same scheme must be used by everything that mints or resolves ids:
-/// the `mode`/`current_mode`/`preferred_mode` events here and the `set_mode`
-/// resolution in [`DcsState::apply_topology`].
+/// the `mode`/`current_mode`/`preferred_mode` events here and
+/// [`PendingUpdate::staged_mode`].
 fn mode_id(index: usize) -> u32 {
     index as u32
+}
+
+impl PendingUpdate {
+    /// The DRM mode a `set_mode` on this update selects, resolved against
+    /// `output`'s mode list. `None` if no mode is staged or the id does not
+    /// belong to the output.
+    pub fn staged_mode<'a>(&self, output: &'a DcsOutput) -> Option<&'a drm::control::Mode> {
+        let id = self.mode_id?;
+        output
+            .connector_modes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| mode_id(*i) == id)
+            .map(|(_, m)| m)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +230,7 @@ impl Dispatch<ZwpDcsManager, ()> for DcsState {
                 data_init.init(
                     id,
                     Mutex::new(WlDcsTopology {
-                        displays: Vec::new(),
+                        updates: Vec::new(),
                         quadro_sync_topology: None,
                     }),
                 );
@@ -280,39 +283,16 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
             // staged too, so it is reported through the commit reply like
             // every other problem rather than at request time.
             zwp_dcs_topology::Request::SetMode { output, id } => {
-                topology.display_mut(&output).mode_id = Some(id);
+                topology.update_mut(&output).mode_id = Some(id);
             }
             zwp_dcs_topology::Request::SetNumber { output, number } => {
-                topology.display_mut(&output).number = Some(number);
+                topology.update_mut(&output).number = Some(number);
             }
             zwp_dcs_topology::Request::Commit => {
-                // Every commit gets exactly one terminator: done, or error
-                // with a null output. Per-display and sub-protocol errors
-                // come first.
-                match state.apply_topology(&topology) {
-                    Ok(()) => resource.done(),
-                    Err(failures) => {
-                        let qs_topo = topology.quadro_sync_topology.as_ref();
-                        for failure in failures {
-                            match failure {
-                                CommitFailure::Display { output, error } => {
-                                    resource.error(Some(&output), error);
-                                }
-                                CommitFailure::QuadroSyncDisplay { output, error } => {
-                                    if let Some(qs) = qs_topo {
-                                        qs.error(Some(&output), error);
-                                    }
-                                }
-                                CommitFailure::QuadroSync => {
-                                    if let Some(qs) = qs_topo {
-                                        qs.error(None, QuadroSyncError::Failed);
-                                    }
-                                }
-                            }
-                        }
-                        resource.error(None, TopologyError::Failed);
-                    }
-                }
+                // Per-display errors are sent from inside apply_topology as
+                // they are found; done ends the reply with the verdict.
+                let ok = state.apply_topology(&topology, resource);
+                resource.done(ok as u32);
             }
             // Staged state dies with the user data; sub-protocol objects are
             // separate resources the client still owns.
@@ -326,6 +306,58 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
 // ---------------------------------------------------------------------------
 
 impl DcsState {
+    /// Turn the core protocol's staged per-display state (`set_mode`,
+    /// `set_number`) into standalone display attributes on `commit`, in the
+    /// client's order. Problems are sent as `error` events on `resource` as
+    /// they are found. Returns whether every update was accepted.
+    fn build_mode_attrs(
+        &self,
+        topology: &WlDcsTopology,
+        resource: &ZwpDcsTopology,
+        commit: &mut crate::attribute::PendingCommit,
+    ) -> bool {
+        use crate::attribute::{display_number::DisplayNumberAttribute, mode::ModeAttribute};
+
+        let mut ok = true;
+
+        for update in &topology.updates {
+            let Some(output) = update.handle.and_then(|h| self.output_for_handle(h)) else {
+                resource.error(&update.output, TopologyError::UnknownOutput);
+                ok = false;
+                continue;
+            };
+            let handle = update.handle.unwrap();
+
+            if update.mode_id.is_some() {
+                match update.staged_mode(output) {
+                    Some(m) => {
+                        let (w, h) = m.size();
+                        commit.display_attrs.push((
+                            handle,
+                            Box::new(ModeAttribute {
+                                width: w as u32,
+                                height: h as u32,
+                                refresh_mhz: m.vrefresh() * 1000,
+                            }),
+                        ));
+                    }
+                    None => {
+                        resource.error(&update.output, TopologyError::InvalidMode);
+                        ok = false;
+                    }
+                }
+            }
+
+            if let Some(number) = update.number {
+                commit
+                    .display_attrs
+                    .push((handle, Box::new(DisplayNumberAttribute { number })));
+            }
+        }
+
+        ok
+    }
+
     /// Apply every staged change in `topology` to the live display state.
     ///
     /// Builds a [`PendingCommit`] from the staged per-display state and any
@@ -338,93 +370,48 @@ impl DcsState {
     /// 4. Apply standalone display attributes.
     ///
     /// Validation is side-effect-free, so every staged display and attribute
-    /// is checked and all problems are collected before anything is applied.
-    /// Returns `Ok(())` when everything applied, or the full list of
-    /// [`CommitFailure`]s. The caller sends the corresponding protocol events.
-    fn apply_topology(&mut self, topology: &WlDcsTopology) -> Result<(), Vec<CommitFailure>> {
-        use crate::attribute::{
-            PendingCommit,
-            display_number::DisplayNumberAttribute,
-            mode::ModeAttribute,
-        };
+    /// is checked before anything is applied. Per-display problems are sent
+    /// as `error` events on `resource` (or on the sub-protocol's own object)
+    /// as they are found. Returns whether the commit was applied; the caller
+    /// sends `done` with that verdict.
+    fn apply_topology(&mut self, topology: &WlDcsTopology, resource: &ZwpDcsTopology) -> bool {
+        use crate::attribute::PendingCommit;
 
         let mut commit = PendingCommit::new();
-        let mut failures = Vec::new();
+        let mut ok = self.build_mode_attrs(topology, resource, &mut commit);
 
         // The QuadroSync extension stages its own per-display roles; turn
         // them into the topology attribute the commit phases understand.
-        if let Some(qs_topo) = &topology.quadro_sync_topology {
+        // Its per-display errors are sent on the extension object by the
+        // builder.
+        if let Some(qs_topo) = topology.quadro_sync_topology.as_ref() {
             match self.build_quadro_sync_attribute(qs_topo) {
                 Ok(Some(attr)) => commit.topology_attrs.push(Box::new(attr)),
                 Ok(None) => {}
-                Err(qs_failures) => failures.extend(qs_failures),
-            }
-        }
-
-        // Per-display base state. `wl_output` lookups for error reporting go
-        // through this list, so keep it in the client's order.
-        for display in &topology.displays {
-            let Some(handle) = display.handle else {
-                failures.push(CommitFailure::Display {
-                    output: display.output.clone(),
-                    error: TopologyError::UnknownOutput,
-                });
-                continue;
-            };
-            let Some(output) = self.output_for_handle(handle) else {
-                failures.push(CommitFailure::Display {
-                    output: display.output.clone(),
-                    error: TopologyError::UnknownOutput,
-                });
-                continue;
-            };
-
-            if let Some(id) = display.mode_id {
-                // Resolve the opaque id back to the DRM mode it was minted from.
-                let drm_mode = output
-                    .connector_modes
-                    .iter()
-                    .enumerate()
-                    .find(|(i, _)| mode_id(*i) == id)
-                    .map(|(_, m)| m);
-                match drm_mode {
-                    Some(m) => {
-                        let (w, h) = m.size();
-                        commit.display_attrs.push((handle, Box::new(ModeAttribute {
-                            width: w as u32,
-                            height: h as u32,
-                            refresh_mhz: m.vrefresh() * 1000,
-                        })));
-                    }
-                    None => failures.push(CommitFailure::Display {
-                        output: display.output.clone(),
-                        error: TopologyError::InvalidMode,
-                    }),
+                Err(e) => {
+                    tracing::error!("quadro_sync topology rejected: {:#}", e);
+                    ok = false;
                 }
-            }
-
-            if let Some(number) = display.number {
-                commit.display_attrs.push((handle, Box::new(DisplayNumberAttribute {
-                    number,
-                })));
             }
         }
 
         // Resolve an OutputHandle back to the wl_output the client used, for
-        // attribute failures below.
+        // base attribute failures below.
         let wl_output_for = |handle: OutputHandle| -> Option<WlOutput> {
             topology
-                .displays
+                .updates
                 .iter()
-                .find(|d| d.handle == Some(handle))
-                .map(|d| d.output.clone())
+                .find(|u| u.handle == Some(handle))
+                .map(|u| u.output.clone())
         };
 
-        // Phase 1: Validate topology attrs across all devices.
+        // Phase 1: Validate topology attrs across all devices. Each attribute
+        // sends its own error events on its sub-protocol object; here we
+        // only need the verdict.
         for topo_attr in &commit.topology_attrs {
-            if let Err(e) = topo_attr.validate(self) {
+            if let Err(e) = topo_attr.validate(self, topology) {
                 tracing::error!("{} topology rejected: {:#}", topo_attr.name(), e);
-                failures.push(CommitFailure::QuadroSync);
+                ok = false;
             }
         }
 
@@ -436,24 +423,23 @@ impl DcsState {
             if let Err(e) = attr.validate(output) {
                 tracing::error!("{} rejected for {:?}: {:#}", attr.name(), handle, e);
                 if let Some(wl_output) = wl_output_for(*handle) {
-                    failures.push(CommitFailure::Display {
-                        output: wl_output,
-                        error: TopologyError::InvalidState,
-                    });
+                    resource.error(&wl_output, TopologyError::InvalidState);
                 }
+                ok = false;
             }
         }
 
         // Nothing is applied unless everything validated.
-        if !failures.is_empty() {
-            return Err(failures);
+        if !ok {
+            return false;
         }
 
-        // Phase 3: Apply topology attrs (each routes to the devices it needs).
+        // Phase 3: Apply topology attrs (each routes to the devices it needs
+        // and reports its own failure on its sub-protocol object).
         for topo_attr in &commit.topology_attrs {
             if let Err(e) = topo_attr.apply(self) {
                 tracing::error!("{} topology apply failed: {:#}", topo_attr.name(), e);
-                failures.push(CommitFailure::QuadroSync);
+                ok = false;
             }
         }
 
@@ -465,18 +451,12 @@ impl DcsState {
             if let Err(e) = attr.apply(output) {
                 tracing::error!("{} apply failed for {:?}: {:#}", attr.name(), handle, e);
                 if let Some(wl_output) = wl_output_for(*handle) {
-                    failures.push(CommitFailure::Display {
-                        output: wl_output,
-                        error: TopologyError::InvalidState,
-                    });
+                    resource.error(&wl_output, TopologyError::InvalidState);
                 }
+                ok = false;
             }
         }
 
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures)
-        }
+        ok
     }
 }

@@ -180,7 +180,7 @@ Core protocol (`src/protocol/zwp_display_config_server_v1.rs`):
 | User data | Attached to | Holds |
 |---|---|---|
 | `WlDcsOutput {handle}` | `zwp_dcs_output` | Which display (as an `OutputHandle`) this object refers to. |
-| `Mutex<WlDcsTopology>` | `zwp_dcs_topology` | `displays: Vec<PendingDisplay>` — one entry per `wl_output` the client has named, holding the `wl_output` resource, its resolved `OutputHandle`, `mode_id: Option<u32>` (opaque id, resolved against `connector_modes` at commit) and `number` — plus `quadro_sync_topology: Option<ZwpDcsQuadroSyncTopology>`. |
+| `Mutex<WlDcsTopology>` | `zwp_dcs_topology` | `updates: Vec<PendingUpdate>` — one entry per `wl_output` the client has named, holding the `wl_output` resource, its resolved `OutputHandle`, `mode_id: Option<u32>` (opaque id, resolved against `connector_modes` at commit) and `number` — plus `quadro_sync_topology: Option<ZwpDcsQuadroSyncTopology>`. |
 
 Request handlers:
 
@@ -194,29 +194,28 @@ Request handlers:
   `main_device`), `number`, `done`.
 - `CreateTopology` — creates the staging object.
 - `SetMode(output, id)` / `SetNumber(output, number)` — record pending
-  values in the topology's `PendingDisplay` entry for that `wl_output`,
+  values in the topology's `PendingUpdate` entry for that `wl_output`,
   creating it on first use and resolving the `OutputHandle` from the
   `wl_output`'s user data. A repeated request for the same output replaces
   the earlier value. An unresolvable `wl_output` is still staged so the
   problem is reported through the commit reply rather than at request time.
-- `Commit` — calls `DcsState::apply_topology`. On success sends `done`. On
-  failure walks the returned `CommitFailure` list, sending
-  `error(output, code)` on the topology for each rejected display and on
-  the QuadroSync extension for each rejected role (or `error(null,
-  failed)` there for a QuadroSync-wide problem), then terminates with
-  `error(null, failed)` on the topology.
+- `Commit` — calls `DcsState::apply_topology`, which sends per-display
+  `error(output, code)` events itself as it finds problems and returns a
+  bool, then sends `done(success)` with that verdict. `done` is always the
+  last event of the reply.
 
-**`apply_topology`** is the heart of a commit and collects every problem
-rather than stopping at the first:
+**`apply_topology`** is the heart of a commit and checks everything before
+applying anything, so the client hears about every problem in one reply:
 
 1. If the topology has a QuadroSync extension, `build_quadro_sync_attribute`
    turns its staged roles and board settings into a
-   `QuadroSyncTopologyAttribute`, reporting unknown outputs and invalid
-   roles as per-display `CommitFailure`s.
-2. For each staged display, resolve the `wl_output` to an `OutputHandle`
-   (`unknown_output` if it cannot be), resolve the mode id against
-   `connector_modes` (`invalid_mode` if it does not exist), and push a
-   `ModeAttribute` and/or `DisplayNumberAttribute`.
+   `QuadroSyncTopologyAttribute`, sending `unknown_output` and
+   `invalid_role` on the extension object itself for roles it rejects.
+2. `apply_core_state`: for each staged update, resolve the `wl_output` to
+   an `OutputHandle` (`unknown_output` if it cannot be), resolve the mode id
+   through `PendingUpdate::staged_mode` (`invalid_mode` if it does not
+   belong to the output), and push a `ModeAttribute` and/or
+   `DisplayNumberAttribute`.
 3. Run four phases over the `PendingCommit`: **validate all topology attrs
    → validate all display attrs → apply all topology attrs → apply all
    display attrs.** Validation is side-effect-free (TEST_ONLY commits,
@@ -233,7 +232,7 @@ does not implement any of this yet: outputs are enumerated once at startup in
 protocol describes cannot occur. When hotplug lands it needs to (a) create
 and destroy `wl_output` globals, (b) drop the removed display from
 `DcsState::devices[..].outputs` so `output_for_handle` fails for it, which is
-what already turns a staged `PendingDisplay` into `unknown_output` at commit,
+what already turns a staged `PendingUpdate` into `unknown_output` at commit,
 and (c) stop sending events on the corresponding `zwp_dcs_output` and
 `zwp_dcs_quadro_sync_output` resources. Nothing about mode ids needs
 changing: they are per-`zwp_dcs_output`, and a re-plugged display gets a new
@@ -402,12 +401,13 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
       `qs_topology.set_role(&wl_output, role)`. No per-display protocol
       objects are created.
    6. Reset the reply state, `wl_topology.commit()`, roundtrip, then fail if
-      any `error` event arrived on the topology or its QuadroSync extension,
-      or if `done` did not. The failure message names each rejected display
-      by number with the reason code. Every commit gets exactly one
-      terminator from the server: `done`, or `error` with a null output.
-   7. Destroy the QuadroSync extension and then the topology. After `done`
-      the protocol requires this; after `error` the topology stays alive so
+      `done` did not arrive or arrived with `success == 0`. The failure
+      message names each rejected display by number with the reason code
+      from the `error` events that preceded `done`, on the topology or its
+      QuadroSync extension. Every commit gets exactly one `done`.
+   7. Destroy the QuadroSync extension and then the topology. After a
+      successful `done` the protocol requires this; after a failed one the
+      topology stays alive so
       a client could adjust and recommit, but `dcs-tool` reports the failure
       and tears down anyway. Every DCS protocol object has a `destroy`
       destructor; the server tolerates a `wl_output` being released or the
@@ -418,7 +418,7 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
 **Server side:**
 
 8. The socket fd wakes calloop; `dispatch_clients` runs every staged request
-   handler: the topology's `PendingDisplay` entries accumulate mode ids and
+   handler: the topology's `PendingUpdate` entries accumulate mode ids and
    numbers per `wl_output`, the QuadroSync extension's `roles` accumulate
    per-`wl_output` roles and board settings, and `GetTopology` records the
    QuadroSync↔base link (`WlDcsTopology.quadro_sync_topology`).
@@ -431,23 +431,29 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
      `DisplayNumberAttribute`;
    - **validate topology attrs** (framelock: at most one server across the
      system, counting servers already configured on displays this commit
-     does not name; at least one named role when enabling sync)
+     does not name; at least one named role when enabling sync; every group
+     member, existing or staged, at the same refresh rate as the server,
+     using the rate a mode change staged in the same `WlDcsTopology` will
+     produce; `validate` receives the whole topology for this)
      → **validate display attrs** (mode: KMS TEST_ONLY atomic commit) →
      **apply topology attrs** (framelock ioctls: disable sync, set roles,
      set board attributes, re-enable) → **apply display attrs**
      (`apply_mode_change`: `use_mode` + `reset_state` + `needs_render`).
-   - Any validation failure aborts before anything is applied; every
-     problem found is returned as a `CommitFailure` so the client gets one
-     `error(output, code)` per rejected display, then the terminating
-     `error(null, failed)`.
+   - Any validation failure aborts before anything is applied. Per-display
+     problems are sent as `error(output, code)` on the topology as they are
+     found; the QuadroSync attribute owns its `zwp_dcs_quadro_sync_topology`
+     resource and each role's `wl_output`, and sends its own per-display
+     errors on the extension object, with a group-wide problem sent there
+     with a null output. `apply_topology` returns false and `done(0)` ends
+     the reply.
 10. Still in the same loop iteration (post-dispatch callback,
    `src/main.rs`), `device.render()` runs: `reset_state()` forced full
    damage, so `render_frame` produces a frame and `queue_frame` performs
    the **atomic KMS commit that carries the modeset**. The VBlank event
    then delivers `frame_submitted`, completing the flip.
-11. `flush_clients` sends the reply, `done` on success or the per-display
-    and terminating `error` events on failure; the client's roundtrip in step 6
-    returns and `dcs-tool` prints success or failure.
+11. `flush_clients` sends the reply: any per-display `error` events, then
+    `done(success)`; the client's roundtrip in step 6 returns and `dcs-tool`
+    prints success or failure.
 
 ## Flow 2: a Vulkan ICD leasing and driving displays
 
