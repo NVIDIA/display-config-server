@@ -241,15 +241,6 @@
       <arg name="id" type="uint" summary="id of the mode to set"/>
     </request>
 
-    <request name="set_number">
-      <description summary="stage a display ID number change">
-        Stages a change of the display's ID number.
-      </description>
-      <arg name="output" type="object" interface="wl_output"
-           summary="the display to change"/>
-      <arg name="number" type="uint" summary="new display ID number"/>
-    </request>
-
     <request name="commit">
       <description summary="commit all staged changes atomically">
         Commits every staged change in this topology and in the sub-protocol

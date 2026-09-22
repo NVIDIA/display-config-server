@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Trait abstractions for display configuration features.
 //!
-//! [`DisplayAttribute`] represents a per-output setting (mode, display number).
+//! [`DisplayAttribute`] represents a per-output setting (mode).
 //! [`TopologyAttribute`] represents a cross-output setting (QuadroSync) that
 //! owns child [`DisplayAttribute`]s and applies them as part of its own logic.
 //!
 //! Both are accumulated in a [`PendingCommit`] and applied atomically when
 //! the config tool commits a topology.
 
-pub mod display_number;
 pub mod mode;
 pub mod quadro_sync;
 
@@ -74,7 +73,7 @@ pub struct PendingCommit {
     pub topology_attrs: Vec<Box<dyn TopologyAttribute>>,
 
     /// Standalone per-output attributes not owned by any topology
-    /// (e.g., mode change, display number).
+    /// (e.g., mode change).
     pub display_attrs: Vec<(OutputHandle, Box<dyn DisplayAttribute>)>,
 }
 

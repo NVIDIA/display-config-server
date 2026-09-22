@@ -193,8 +193,8 @@ Request handlers:
   list, plus `device` (dev_t as a native-endian `wl_array`, like dmabuf
   `main_device`), `number`, `done`.
 - `CreateTopology` — creates the staging object.
-- `SetMode(output, id)` / `SetNumber(output, number)` — record pending
-  values in the topology's `PendingUpdate` entry for that `wl_output`,
+- `SetMode(output, id)` — records the pending mode id in the topology's
+  `PendingUpdate` entry for that `wl_output`,
   creating it on first use and resolving the `OutputHandle` from the
   `wl_output`'s user data. A repeated request for the same output replaces
   the earlier value. An unresolvable `wl_output` is still staged so the
@@ -214,8 +214,7 @@ applying anything, so the client hears about every problem in one reply:
 2. `apply_core_state`: for each staged update, resolve the `wl_output` to
    an `OutputHandle` (`unknown_output` if it cannot be), resolve the mode id
    through `PendingUpdate::staged_mode` (`invalid_mode` if it does not
-   belong to the output), and push a `ModeAttribute` and/or
-   `DisplayNumberAttribute`.
+   belong to the output), and push a `ModeAttribute`.
 3. Run four phases over the `PendingCommit`: **validate all topology attrs
    → validate all display attrs → apply all topology attrs → apply all
    display attrs.** Validation is side-effect-free (TEST_ONLY commits,
@@ -427,8 +426,7 @@ Example: `dcs-tool apply --display 1 --mode 1920x1080@60000 --qs-role 1=server -
    - `build_quadro_sync_attribute` turns the staged QuadroSync state into a
      `QuadroSyncTopologyAttribute` (roles resolved OutputHandle → connector
      id);
-   - each staged display contributes a `ModeAttribute` /
-     `DisplayNumberAttribute`;
+   - each staged display contributes a `ModeAttribute`;
    - **validate topology attrs** (framelock: at most one server across the
      system, counting servers already configured on displays this commit
      does not name; at least one named role when enabling sync; every group

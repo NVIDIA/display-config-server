@@ -55,7 +55,7 @@ pub struct WlDcsOutput {
     pub handle: Option<OutputHandle>,
 }
 
-/// State staged for one display by `set_mode` / `set_number`.
+/// State staged for one display by `set_mode`.
 pub struct PendingUpdate {
     /// The `wl_output` the client named. Kept so commit errors can point at it.
     pub output: WlOutput,
@@ -65,8 +65,6 @@ pub struct PendingUpdate {
     pub handle: Option<OutputHandle>,
     /// Opaque mode id from a `zwp_dcs_output.mode` event (see [`mode_id`]).
     pub mode_id: Option<u32>,
-    /// New display ID number.
-    pub number: Option<u32>,
 }
 
 /// Per-resource state for a `zwp_dcs_topology` protocol object.
@@ -93,7 +91,6 @@ impl WlDcsTopology {
             output: output.clone(),
             handle: output.data::<OutputHandle>().copied(),
             mode_id: None,
-            number: None,
         });
         self.updates.last_mut().unwrap()
     }
@@ -285,9 +282,6 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
             zwp_dcs_topology::Request::SetMode { output, id } => {
                 topology.update_mut(&output).mode_id = Some(id);
             }
-            zwp_dcs_topology::Request::SetNumber { output, number } => {
-                topology.update_mut(&output).number = Some(number);
-            }
             zwp_dcs_topology::Request::Commit => {
                 // Per-display errors are sent from inside apply_topology as
                 // they are found; done ends the reply with the verdict.
@@ -306,17 +300,17 @@ impl Dispatch<ZwpDcsTopology, Mutex<WlDcsTopology>> for DcsState {
 // ---------------------------------------------------------------------------
 
 impl DcsState {
-    /// Turn the core protocol's staged per-display state (`set_mode`,
-    /// `set_number`) into standalone display attributes on `commit`, in the
-    /// client's order. Problems are sent as `error` events on `resource` as
-    /// they are found. Returns whether every update was accepted.
+    /// Turn the core protocol's staged per-display state (`set_mode`) into
+    /// standalone display attributes on `commit`, in the client's order.
+    /// Problems are sent as `error` events on `resource` as they are found.
+    /// Returns whether every update was accepted.
     fn build_mode_attrs(
         &self,
         topology: &WlDcsTopology,
         resource: &ZwpDcsTopology,
         commit: &mut crate::attribute::PendingCommit,
     ) -> bool {
-        use crate::attribute::{display_number::DisplayNumberAttribute, mode::ModeAttribute};
+        use crate::attribute::mode::ModeAttribute;
 
         let mut ok = true;
 
@@ -346,12 +340,6 @@ impl DcsState {
                         ok = false;
                     }
                 }
-            }
-
-            if let Some(number) = update.number {
-                commit
-                    .display_attrs
-                    .push((handle, Box::new(DisplayNumberAttribute { number })));
             }
         }
 
