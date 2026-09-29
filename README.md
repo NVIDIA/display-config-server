@@ -127,6 +127,160 @@ with that DRM object id, which is useful when debugging a single display.
 Log output is controlled by the `RUST_LOG` environment variable (e.g.
 `RUST_LOG=debug`).
 
+## Usage examples
+
+The examples below assume `display-config-server` and `dcs-tool` are on your
+`PATH` and that you are running as a user with access to `/dev/dri`.
+
+### Starting DCS
+
+Start DCS managing all connected displays across every GPU:
+
+```sh
+display-config-server
+```
+
+To restrict DCS to one GPU and enable verbose logging:
+
+```sh
+RUST_LOG=debug display-config-server --card 0
+```
+
+DCS holds the display link open and renders a splash screen until a Vulkan D2D
+application connects. It listens on a Wayland socket; clients discover it via
+the standard `WAYLAND_DISPLAY` environment variable.
+
+### Showing the current configuration
+
+```sh
+dcs-tool show
+```
+
+Example output with two displays and RTX Pro Sync hardware present:
+
+```
+Display  1  (dev 234881027)
+  * 3840x2160@60000mHz [current]
+    3840x2160@30000mHz
+    1920x1080@60000mHz [preferred]
+  QuadroSync role: disabled, sync: inactive, board: 0
+
+Display  2  (dev 234881027)
+  * 1920x1080@60000mHz [current] [preferred]
+  QuadroSync role: disabled, sync: inactive, board: 0
+
+QuadroSync: supported
+```
+
+The asterisk (`*`) marks the active mode. Display numbers are assigned by DCS
+and are used as the target for all `apply` commands.
+
+### Applying a mode to a single display
+
+Set display 1 to 1920×1080 at 60 Hz:
+
+```sh
+dcs-tool apply --display 1 --mode 1920x1080@60000
+```
+
+The refresh rate is in millihertz. 60 Hz = `60000`, 120 Hz = `120000`.
+
+### Configuring multiple displays
+
+`--display` and `--mode` are paired positionally and may be repeated to
+configure several displays in one atomic commit:
+
+```sh
+dcs-tool apply \
+  --display 1 --mode 3840x2160@60000 \
+  --display 2 --mode 3840x2160@60000
+```
+
+Alternatively, write the configuration to a YAML file and apply it:
+
+```yaml
+# /etc/dcs/wall.yaml
+topology:
+  - display:
+      - number: 1
+        mode: {width: 3840, height: 2160, refresh_mhz: 60000}
+      - number: 2
+        mode: {width: 3840, height: 2160, refresh_mhz: 60000}
+```
+
+```sh
+dcs-tool apply --config /etc/dcs/wall.yaml
+```
+
+### RTX Pro Sync across two systems
+
+RTX Pro Sync (formerly QuadroSync) locks the scan-out timing of displays on
+separate machines to a common sync signal via a hardware cable between their
+RTX Pro Sync boards. One machine acts as the framelock **server** and the
+other as a framelock **client**. Both displays must run at the same refresh
+rate.
+
+**Machine A — framelock server**
+
+```sh
+dcs-tool apply \
+  --display 1 --mode 1920x1080@60000 \
+  --qs-role 1=server \
+  --qs-enable
+```
+
+**Machine B — framelock client**
+
+```sh
+dcs-tool apply \
+  --display 1 --mode 1920x1080@60000 \
+  --qs-role 1=client \
+  --qs-enable
+```
+
+The same setup expressed as YAML config files (useful for applying the
+configuration at boot via a service unit):
+
+```yaml
+# Machine A — /etc/dcs/sync-server.yaml
+topology:
+  - display:
+      - number: 1
+        mode: {width: 1920, height: 1080, refresh_mhz: 60000}
+        quadro_sync_role: server
+    quadro_sync:
+      sync_enable: true
+```
+
+```yaml
+# Machine B — /etc/dcs/sync-client.yaml
+topology:
+  - display:
+      - number: 1
+        mode: {width: 1920, height: 1080, refresh_mhz: 60000}
+        quadro_sync_role: client
+    quadro_sync:
+      sync_enable: true
+```
+
+```sh
+dcs-tool apply --config /etc/dcs/sync-server.yaml   # on machine A
+dcs-tool apply --config /etc/dcs/sync-client.yaml   # on machine B
+```
+
+Optional board-level settings can be added to the server topology when needed:
+
+```yaml
+    quadro_sync:
+      sync_delay: 0
+      polarity: rising_edge       # rising_edge | falling_edge | both_edges
+      house_sync_mode: disabled   # disabled | input | output
+      sync_enable: true
+```
+
+After applying, run `dcs-tool show` on each machine to confirm
+`QuadroSync role: server` / `client` and `sync: active`.
+
 ## License
 
 See [LICENSE](LICENSE).
